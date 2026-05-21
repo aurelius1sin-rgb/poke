@@ -1,0 +1,4739 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Poker Post-Flop Analyser</title>
+  <style>
+    html, body { margin: 0; padding: 0; background: #0f1115; min-height: 100vh; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; }
+    #root { min-height: 100vh; }
+    .loading { color: #9aa0a6; text-align: center; padding: 4rem 1rem; font-size: 14px; }
+  </style>
+</head>
+<body>
+  <div id="root"><div class="loading">Compiling app (first load takes a few seconds)...</div></div>
+  <script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+  <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.23.5/babel.min.js"></script>
+  <script type="text/babel" data-presets="react">
+const { useState, useMemo, useEffect, useRef } = React;
+
+// ============================================================
+// CONSTANTS
+// ============================================================
+
+const RANKS = ['A','K','Q','J','T','9','8','7','6','5','4','3','2'];
+const SUITS = ['s','h','d','c'];
+const SUIT_SYMBOLS = { s: '\u2660', h: '\u2665', d: '\u2666', c: '\u2663' };
+const SUIT_NAMES = { s: 'Spades', h: 'Hearts', d: 'Diamonds', c: 'Clubs' };
+// ---- TEXT-INPUT PARSERS (hole cards + board) ----
+function _parseHoleInput(s) {
+  if (!s) return null;
+  s = s.trim();
+  if (!s.length) return null;
+  const upper = s.toUpperCase();
+  // 4-char: exact combo "AhKs"
+  if (s.length === 4) {
+    const r1 = upper[0], su1 = s[1].toLowerCase();
+    const r2 = upper[2], su2 = s[3].toLowerCase();
+    if (!RANKS.includes(r1) || !RANKS.includes(r2)) return null;
+    if (!SUITS.includes(su1) || !SUITS.includes(su2)) return null;
+    if (r1 === r2 && su1 === su2) return null;
+    return { type: 'combo', combo: [{ rank: r1, suit: su1 }, { rank: r2, suit: su2 }] };
+  }
+  // 2-char: pocket pair "TT"
+  if (s.length === 2 && upper[0] === upper[1]) {
+    const r = upper[0];
+    if (!RANKS.includes(r)) return null;
+    return { type: 'hand', hand: { r1: r, r2: r, type: 'pair', label: r + r } };
+  }
+  // 3-char: "AKs" or "AKo"
+  if (s.length === 3) {
+    const r1 = upper[0], r2 = upper[1];
+    const t = s[2].toLowerCase();
+    if (!RANKS.includes(r1) || !RANKS.includes(r2)) return null;
+    if (r1 === r2) return null;
+    if (t !== 's' && t !== 'o') return null;
+    const i1 = RANKS.indexOf(r1), i2 = RANKS.indexOf(r2);
+    const [hi, lo] = i1 < i2 ? [r1, r2] : [r2, r1];
+    return { type: 'hand', hand: { r1: hi, r2: lo, type: t === 's' ? 'suited' : 'offsuit', label: hi + lo + t } };
+  }
+  return null;
+}
+
+function _comboToHand(combo) {
+  const [c1, c2] = combo;
+  if (c1.rank === c2.rank) return { r1: c1.rank, r2: c2.rank, type: 'pair', label: c1.rank + c2.rank };
+  const i1 = RANKS.indexOf(c1.rank), i2 = RANKS.indexOf(c2.rank);
+  const [hi, lo] = i1 < i2 ? [c1.rank, c2.rank] : [c2.rank, c1.rank];
+  const type = c1.suit === c2.suit ? 'suited' : 'offsuit';
+  return { r1: hi, r2: lo, type, label: hi + lo + (type === 'suited' ? 's' : 'o') };
+}
+
+function _parseBoardInput(s) {
+  if (!s) return [];
+  const tokens = s.toUpperCase().match(/[2-9TJQKA][HDCS]/g) || [];
+  return tokens.map(t => ({ rank: t[0], suit: t[1].toLowerCase() }));
+}
+
+const SUIT_COLORS = {
+  h: '#cf2f36',
+  d: '#2f6fdd',
+  c: '#2e8b57',
+  s: '#151515',
+};
+const RANK_VAL = { A:14, K:13, Q:12, J:11, T:10, '9':9, '8':8, '7':7, '6':6, '5':5, '4':4, '3':3, '2':2 };
+
+const POSITIONS_8 = ['UTG', 'UTG+1', 'MP', 'HJ', 'CO', 'BTN', 'SB', 'BB'];
+const POSTFLOP_ORDER = ['SB','BB','UTG','UTG+1','MP','HJ','CO','BTN'];
+const BET_SIZES = [25, 50, 75, 100];
+const POSTFLOP_RAISE_MULTIPLIER = 3;
+const POSTFLOP_3BET_MULTIPLIER = 9;
+const EQUITY_EXACT_EVAL_LIMIT = 50000;
+const EQUITY_MONTE_CARLO_TRIALS = 35000;
+const EQUITY_CACHE_LIMIT = 600;
+const HEADS_UP_RUNOUT_SAMPLES = 64;
+const HEADS_UP_EQUITY_CACHE_LIMIT = 1400;
+const RESPONSE_SCORE_CACHE_LIMIT = 120;
+const RESPONSE_CACHE_LIMIT = 360;
+const BOARD_LABELS = ['Flop 1', 'Flop 2', 'Flop 3', 'Turn', 'River'];
+const STREET_SEQUENCE = ['flop', 'turn', 'river'];
+const STREET_CONFIG = {
+  flop: { label: 'Flop', cards: 3 },
+  turn: { label: 'Turn', cards: 4 },
+  river: { label: 'River', cards: 5 },
+};
+
+const ACTION_COLORS = {
+  bet: '#c9a961',
+  raise: '#c9a961',
+  call: '#4a8b6a',
+  check: '#4a8b6a',
+  fold: '#9a3737',
+};
+
+// Paste or import exact solver nodes into this object, keyed by buildGtoNodeKey().
+// The app also checks window.GTO_SOLVER_NODES for externally loaded data.
+const GTO_NODE_LIBRARY = {};
+
+// Common-spot solved libraries can be keyed by buildAbstractSpotKey().
+// This is intentionally empty until you provide licensed/exported solves.
+// The app also checks window.PRESOLVED_GTO_LIBRARY for these abstract keys.
+const PRESOLVED_COMMON_LIBRARY = {};
+
+// ============================================================
+// LINE BUILDERS
+// ============================================================
+
+function slugify(text) {
+  return text.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '');
+}
+
+function buildPreflopLines() {
+  const lines = [];
+  POSITIONS_8.slice(0, -1).forEach((opener, openerIdx) => {
+    POSITIONS_8.slice(openerIdx + 1).forEach(defender => {
+      lines.push({
+        id: slugify(`${opener} raise ${defender} call`),
+        label: `${opener} raise ${defender} call`,
+        group: `${opener} open spots`,
+        players: [opener, defender],
+        opener,
+        defender,
+        aggressor: opener,
+        potType: 'SRP',
+        potBB: 6,
+        commitmentBB: 3,
+      });
+      lines.push({
+        id: slugify(`${opener} raise ${defender} 3bet ${opener} call`),
+        label: `${opener} raise ${defender} 3bet ${opener} call`,
+        group: `${opener} open spots`,
+        players: [opener, defender],
+        opener,
+        defender,
+        aggressor: defender,
+        potType: '3BP',
+        potBB: 18,
+        commitmentBB: 9,
+      });
+      lines.push({
+        id: slugify(`${opener} raise ${defender} 3bet ${opener} 4bet ${defender} call`),
+        label: `${opener} raise ${defender} 3bet ${opener} 4bet ${defender} call`,
+        group: `${opener} open spots`,
+        players: [opener, defender],
+        opener,
+        defender,
+        aggressor: opener,
+        potType: '4BP',
+        potBB: 42,
+        commitmentBB: 21,
+      });
+    });
+  });
+  return lines;
+}
+
+const PREFLOP_LINES = buildPreflopLines();
+
+function calcPotMultiplier(betSize, raised, threeBet) {
+  // Pot growth on a street, each "raise" being to 3x the prior bet.
+  //  - bet X, call:                          each puts X     -> +2X     -> mult = 1 + 2X/100
+  //  - bet X, raise to 3X, call:             each puts 3X    -> +6X     -> mult = 1 + 6X/100
+  //  - bet X, raise to 3X, 3bet to 9X, call: each puts 9X    -> +18X    -> mult = 1 + 18X/100
+  if (!betSize) return 1;
+  if (threeBet) return 1 + 2 * POSTFLOP_3BET_MULTIPLIER * (betSize / 100);
+  if (raised)   return 1 + 2 * POSTFLOP_RAISE_MULTIPLIER * (betSize / 100);
+  return            1 + 2  * (betSize / 100);
+}
+
+function calcStreetCommitmentMultiplier(betSize, raised, threeBet) {
+  if (!betSize) return 0;
+  if (threeBet) return POSTFLOP_3BET_MULTIPLIER * (betSize / 100);
+  if (raised) return POSTFLOP_RAISE_MULTIPLIER * (betSize / 100);
+  return betSize / 100;
+}
+
+function makeStreetLine(id, label, betSize = 0, raised = false, threeBet = false, lastAggressor = null, group = 'first-to-act') {
+  return {
+    id,
+    label,
+    betSize,
+    raised,
+    threeBet,
+    lastAggressor,
+    group,
+    potMultiplier: calcPotMultiplier(betSize, raised, threeBet),
+    commitmentMultiplier: calcStreetCommitmentMultiplier(betSize, raised, threeBet),
+  };
+}
+
+function makePostflopLines(heroIsIP) {
+  if (heroIsIP === null) return [];
+
+  // Compact label notation:
+  //   "V x"   = villain checks    ·  "H x"   = hero checks
+  //   "V 25%" = villain bets 25%  ·  "CR"    = check-raise to 3x
+  //   "3-bet" = re-raise to 3x the raise
+  // Left-to-right ordering is chronological.
+
+  const lines = [];
+  if (heroIsIP) {
+    lines.push(makeStreetLine(
+      'ip-check-check',
+      'V x \u2192 H x',
+      0, false, false, null, 'first-to-act'
+    ));
+    BET_SIZES.forEach(size => {
+      lines.push(makeStreetLine(
+        `ip-check-hero-bet-${size}-call`,
+        `V x \u2192 H ${size}% \u2192 V call`,
+        size, false, false, 'Hero', 'check-route'
+      ));
+      lines.push(makeStreetLine(
+        `ip-check-hero-bet-${size}-checkraise-call`,
+        `V x \u2192 H ${size}% \u2192 V CR \u2192 H call`,
+        size, true, false, 'Villain', 'check-route'
+      ));
+      lines.push(makeStreetLine(
+        `ip-check-hero-bet-${size}-checkraise-3bet-call`,
+        `V x \u2192 H ${size}% \u2192 V CR \u2192 H 3-bet \u2192 V call`,
+        size, true, true, 'Hero', 'check-route'
+      ));
+    });
+    BET_SIZES.forEach(size => {
+      lines.push(makeStreetLine(
+        `ip-villain-bet-${size}-hero-call`,
+        `V ${size}% \u2192 H call`,
+        size, false, false, 'Villain', 'bet-route'
+      ));
+      lines.push(makeStreetLine(
+        `ip-villain-bet-${size}-hero-raise-call`,
+        `V ${size}% \u2192 H raise \u2192 V call`,
+        size, true, false, 'Hero', 'bet-route'
+      ));
+      lines.push(makeStreetLine(
+        `ip-villain-bet-${size}-hero-raise-3bet-call`,
+        `V ${size}% \u2192 H raise \u2192 V 3-bet \u2192 H call`,
+        size, true, true, 'Villain', 'bet-route'
+      ));
+    });
+    return lines;
+  }
+
+  // OOP
+  lines.push(makeStreetLine(
+    'oop-check-check',
+    'H x \u2192 V x',
+    0, false, false, null, 'first-to-act'
+  ));
+  BET_SIZES.forEach(size => {
+    lines.push(makeStreetLine(
+      `oop-hero-check-villain-bet-${size}-call`,
+      `H x \u2192 V ${size}% \u2192 H call`,
+      size, false, false, 'Villain', 'check-route'
+    ));
+    lines.push(makeStreetLine(
+      `oop-hero-check-villain-bet-${size}-checkraise-call`,
+      `H x \u2192 V ${size}% \u2192 H CR \u2192 V call`,
+      size, true, false, 'Hero', 'check-route'
+    ));
+    lines.push(makeStreetLine(
+      `oop-hero-check-villain-bet-${size}-checkraise-3bet-call`,
+      `H x \u2192 V ${size}% \u2192 H CR \u2192 V 3-bet \u2192 H call`,
+      size, true, true, 'Villain', 'check-route'
+    ));
+  });
+  BET_SIZES.forEach(size => {
+    lines.push(makeStreetLine(
+      `oop-hero-bet-${size}-villain-call`,
+      `H ${size}% \u2192 V call`,
+      size, false, false, 'Hero', 'bet-route'
+    ));
+    lines.push(makeStreetLine(
+      `oop-hero-bet-${size}-villain-raise-call`,
+      `H ${size}% \u2192 V raise \u2192 H call`,
+      size, true, false, 'Villain', 'bet-route'
+    ));
+    lines.push(makeStreetLine(
+      `oop-hero-bet-${size}-villain-raise-3bet-call`,
+      `H ${size}% \u2192 V raise \u2192 H 3-bet \u2192 V call`,
+      size, true, true, 'Hero', 'bet-route'
+    ));
+  });
+  return lines;
+}
+
+function getDecisionOptions(heroIsIP) {
+  if (heroIsIP === null) return [];
+
+  if (heroIsIP) {
+    return [
+      { id: 'ip-villain-checks-to-hero', label: 'V x \u2192 my turn', type: 'checked-to', group: 'first-to-act' },
+      ...BET_SIZES.map(size => ({
+        id: `ip-villain-check-hero-bet-${size}-villain-checkraise`,
+        label: `V x \u2192 H ${size}% \u2192 V CR \u2192 my turn`,
+        type: 'facing-raise',
+        initialBetSize: size,
+        group: 'check-route',
+      })),
+      ...BET_SIZES.map(size => ({
+        id: `ip-facing-villain-bet-${size}`,
+        label: `V ${size}% \u2192 my turn`,
+        type: 'facing-bet',
+        betSize: size,
+        group: 'bet-route',
+      })),
+      ...BET_SIZES.map(size => ({
+        id: `ip-villain-bet-${size}-hero-raise-villain-3bet`,
+        label: `V ${size}% \u2192 H raise \u2192 V 3-bet \u2192 my turn`,
+        type: 'facing-3bet',
+        initialBetSize: size,
+        group: 'bet-route',
+      })),
+    ];
+  }
+
+  return [
+    { id: 'oop-hero-first-to-act', label: 'I act first (no action yet)', type: 'first-to-act', group: 'first-to-act' },
+    ...BET_SIZES.map(size => ({
+      id: `oop-hero-check-facing-villain-bet-${size}`,
+      label: `H x \u2192 V ${size}% \u2192 my turn`,
+      type: 'facing-bet',
+      betSize: size,
+      group: 'check-route',
+    })),
+    ...BET_SIZES.map(size => ({
+      id: `oop-hero-check-villain-bet-${size}-checkraise-villain-3bet`,
+      label: `H x \u2192 V ${size}% \u2192 H CR \u2192 V 3-bet \u2192 my turn`,
+      type: 'facing-3bet',
+      initialBetSize: size,
+      group: 'check-route',
+    })),
+    ...BET_SIZES.map(size => ({
+      id: `oop-hero-bet-${size}-villain-raise`,
+      label: `H ${size}% \u2192 V raise \u2192 my turn`,
+      type: 'facing-raise',
+      initialBetSize: size,
+      group: 'bet-route',
+    })),
+  ];
+}
+
+
+// ============================================================
+// HAND EVALUATION
+// ============================================================
+
+function evalHand(heroCards, board) {
+  const all = [...heroCards, ...board];
+  const canImprove = board.length < 5;
+  const rankCount = {};
+  const suitCount = {};
+  all.forEach(c => {
+    rankCount[c.rank] = (rankCount[c.rank] || 0) + 1;
+    suitCount[c.suit] = (suitCount[c.suit] || 0) + 1;
+  });
+
+  const boardRanks = board.map(c => RANK_VAL[c.rank]).sort((a,b) => b-a);
+  const heroRanks = heroCards.map(c => RANK_VAL[c.rank]).sort((a,b) => b-a);
+
+  let made = 'high-card';
+  let madeLabel = 'High Card';
+  let strength = 0;
+
+  const counts = Object.values(rankCount).sort((a,b) => b-a);
+
+  if (counts[0] >= 3 && counts[1] >= 2) {
+    made = 'full-house'; madeLabel = 'Full House'; strength = 99;
+  } else if (counts[0] >= 3) {
+    const tripRank = Object.keys(rankCount).find(r => rankCount[r] === 3);
+    const heroHasIt = heroCards.filter(c => c.rank === tripRank).length;
+    if (heroHasIt === 2) { made = 'set'; madeLabel = 'Set'; strength = 94; }
+    else { made = 'trips'; madeLabel = 'Trips'; strength = 90; }
+  } else if (counts[0] === 2 && counts[1] === 2) {
+    made = 'two-pair'; madeLabel = 'Two Pair'; strength = 82;
+  } else if (counts[0] === 2) {
+    const pairRank = Object.keys(rankCount).find(r => rankCount[r] === 2);
+    const pairVal = RANK_VAL[pairRank];
+    const heroPairCount = heroCards.filter(c => c.rank === pairRank).length;
+    if (heroPairCount === 2) {
+      if (pairVal > boardRanks[0]) { made = 'overpair'; madeLabel = 'Overpair'; strength = 75; }
+      else if (boardRanks[1] && pairVal > boardRanks[1]) { made = 'pp-middle'; madeLabel = 'Pocket Pair'; strength = 38; }
+      else { made = 'pp-under'; madeLabel = 'Underpair'; strength = 18; }
+    } else if (heroPairCount === 1) {
+      const kicker = heroCards.find(c => c.rank !== pairRank);
+      const kickerVal = kicker ? RANK_VAL[kicker.rank] : 0;
+      if (pairVal === boardRanks[0]) {
+        made = 'top-pair';
+        madeLabel = `Top Pair (${kicker?.rank || '?'} kicker)`;
+        strength = 55 + Math.min(15, (kickerVal - 2) * 1.1);
+      } else if (pairVal === boardRanks[1]) {
+        made = 'middle-pair'; madeLabel = 'Middle Pair'; strength = 40;
+      } else {
+        made = 'bottom-pair'; madeLabel = 'Bottom Pair'; strength = 28;
+      }
+    } else {
+      made = 'paired-board'; madeLabel = 'Unimproved'; strength = 6;
+    }
+  }
+
+  const maxSuit = Math.max(...Object.values(suitCount));
+  const heroSuits = heroCards.map(c => c.suit);
+  let flush = false, flushDraw = false, backdoorFD = false;
+  if (maxSuit >= 5) {
+    flush = true; made = 'flush'; madeLabel = 'Flush'; strength = 95;
+  } else if (maxSuit === 4 && canImprove) {
+    const flushSuit = Object.keys(suitCount).find(s => suitCount[s] === 4);
+    if (heroSuits.includes(flushSuit)) flushDraw = true;
+  } else if (maxSuit === 3 && heroSuits[0] === heroSuits[1] && canImprove) {
+    const flushSuit = Object.keys(suitCount).find(s => suitCount[s] === 3);
+    if (heroSuits.includes(flushSuit)) backdoorFD = true;
+  }
+
+  const uniqueRanks = [...new Set(all.map(c => RANK_VAL[c.rank]))].sort((a,b) => a-b);
+  if (uniqueRanks.includes(14)) uniqueRanks.unshift(1);
+
+  let straight = false, oesd = false, gutshot = false;
+  for (let i = 0; i <= uniqueRanks.length - 5; i++) {
+    if (uniqueRanks[i+4] - uniqueRanks[i] === 4) {
+      straight = true; made = 'straight'; madeLabel = 'Straight'; strength = 92;
+      break;
+    }
+  }
+  if (!straight && canImprove) {
+    const heroVals = heroCards.map(c => RANK_VAL[c.rank]);
+    for (let i = 0; i <= uniqueRanks.length - 4; i++) {
+      if (uniqueRanks[i+3] - uniqueRanks[i] === 3) {
+        const seq = uniqueRanks.slice(i, i+4);
+        if (seq[0] > 1 && seq[3] < 14 && seq.some(v => heroVals.includes(v))) {
+          oesd = true;
+        }
+      }
+    }
+    if (!oesd) {
+      for (let i = 0; i < uniqueRanks.length; i++) {
+        for (let j = i+1; j < uniqueRanks.length; j++) {
+          if (uniqueRanks[j] - uniqueRanks[i] === 4) {
+            const window = uniqueRanks.filter(v => v >= uniqueRanks[i] && v <= uniqueRanks[j]);
+            if (window.length === 4 && window.some(v => heroVals.includes(v))) {
+              gutshot = true;
+            }
+          }
+        }
+      }
+    }
+  }
+
+  const topBoard = boardRanks[0];
+  const overcards = heroRanks.filter(r => r > topBoard).length;
+  let drawEquity = 0;
+  if (flushDraw) drawEquity += 18;
+  if (oesd) drawEquity += 14;
+  if (gutshot && !oesd) drawEquity += 5;
+  if (backdoorFD && !flushDraw) drawEquity += 2;
+
+  if (made === 'high-card' || made === 'paired-board') {
+    strength = overcards * 5 + drawEquity;
+  } else {
+    strength = Math.min(96, strength + drawEquity * 0.25);
+  }
+
+  const drawLabels = [];
+  if (!flush) {
+    if (flushDraw) drawLabels.push('Flush Draw');
+    if (oesd) drawLabels.push('OESD');
+    if (gutshot && !oesd) drawLabels.push('Gutshot');
+    if (backdoorFD && !flushDraw) drawLabels.push('Backdoor FD');
+  }
+
+  return {
+    made,
+    madeLabel,
+    strength,
+    flush,
+    flushDraw,
+    backdoorFD,
+    straight,
+    oesd,
+    gutshot,
+    overcards,
+    drawLabels,
+    boardTexture: getBoardTexture(board),
+  };
+}
+
+function getBoardTexture(board) {
+  const rankCounts = {};
+  const suitCounts = {};
+  board.forEach(card => {
+    rankCounts[card.rank] = (rankCounts[card.rank] || 0) + 1;
+    suitCounts[card.suit] = (suitCounts[card.suit] || 0) + 1;
+  });
+
+  const ranks = [...new Set(board.map(card => RANK_VAL[card.rank]))].sort((a,b) => a-b);
+  const paired = Object.values(rankCounts).some(count => count >= 2);
+  const monotone = Object.values(suitCounts).some(count => count >= 3);
+  const twoTone = Object.values(suitCounts).some(count => count === 2);
+  let connected = 0;
+  for (let i = 1; i < ranks.length; i++) {
+    if (ranks[i] - ranks[i - 1] <= 2) connected += 1;
+  }
+  const highCard = Math.max(...ranks);
+  const wetness = (monotone ? 3 : twoTone ? 1 : 0) + connected + (paired ? -1 : 0);
+
+  return {
+    paired,
+    monotone,
+    twoTone,
+    connected,
+    highCard,
+    wetness,
+  };
+}
+
+// ============================================================
+// PREFLOP RANGE LIBRARY (8-max NL cash, 100bb)
+// ============================================================
+// Cash-game baselines used for both the visible 13x13 charts and the
+// villain range that feeds equity/recommendations. RFI ranges use the
+// public PokerCoaching 8-max/full-ring cash-game shorthand as the anchor;
+// response ranges are conservative 100bb cash defaults in the same format.
+
+const _R = (...hands) => new Set(hands);
+
+function expandRangeToken(token) {
+  const clean = String(token || '').trim();
+  if (!clean) return [];
+  const plus = clean.endsWith('+');
+  const base = plus ? clean.slice(0, -1) : clean;
+  if (!plus) return [base];
+
+  if (base.length === 2 && base[0] === base[1]) {
+    const start = RANKS.indexOf(base[0]);
+    return start === -1 ? [] : RANKS.slice(0, start + 1).map(rank => rank + rank);
+  }
+
+  if (base.length === 3) {
+    const high = base[0];
+    const low = base[1];
+    const suitedness = base[2];
+    const highIdx = RANKS.indexOf(high);
+    const lowIdx = RANKS.indexOf(low);
+    if (highIdx === -1 || lowIdx === -1 || highIdx >= lowIdx) return [];
+    return RANKS.slice(highIdx + 1, lowIdx + 1).map(rank => high + rank + suitedness);
+  }
+
+  return [base];
+}
+
+function rangeFromNotation(text) {
+  const hands = String(text || '')
+    .split(',')
+    .flatMap(token => expandRangeToken(token));
+  return _R(...hands);
+}
+
+const RFI_RANGES = {
+  UTG: rangeFromNotation('77+,A3s+,K9s+,QTs+,JTs,T9s,AQo+,KQo'),
+  'UTG+1': rangeFromNotation('77+,A3s+,K8s+,QTs+,JTs,T9s,AJo+,KQo'),
+  MP: rangeFromNotation('66+,A2s+,K7s+,QTs+,JTs,T9s,ATo+,KJo+'),
+  HJ: rangeFromNotation('55+,A2s+,K5s+,Q9s+,J9s+,T9s,ATo+,KTo+,QJo'),
+  CO: rangeFromNotation('44+,A2s+,K5s+,Q8s+,J8s+,T8s+,97s+,87s,76s,65s,54s,A8o+,KTo+,QTo+,JTo'),
+  BTN: rangeFromNotation('22+,A2s+,K2s+,Q3s+,J5s+,T6s+,96s+,86s+,75s+,65s,54s,A4o+,K9o+,Q9o+,J9o+,T9o'),
+  SB: rangeFromNotation('22+,A2s+,K2s+,Q2s+,J3s+,T5s+,95s+,85s+,75s+,64s+,54s,43s,A3o+,K8o+,Q8o+,J8o+,T8o+,98o,87o'),
+};
+
+const DEFEND_RANGES = {
+  'UTG+1|UTG': _R('QQ','JJ','TT','99','88','AQs','AJs','KQs','QJs','JTs'),
+  'MP|UTG':    _R('JJ','TT','99','88','77','AQs','AJs','KQs','QJs','JTs','T9s'),
+  'MP|UTG+1':  _R('JJ','TT','99','88','77','AQs','AJs','ATs','KQs','KJs','QJs','JTs','T9s'),
+  'HJ|UTG':  _R('JJ','TT','99','88','AQs','AJs','KQs','QJs','JTs'),
+  'HJ|UTG+1': _R('JJ','TT','99','88','77','AQs','AJs','ATs','KQs','KJs','QJs','JTs','T9s'),
+  'HJ|MP':    _R('TT','99','88','77','66','AQs','AJs','ATs','KQs','KJs','QJs','JTs','T9s','98s'),
+  'CO|UTG':  _R('JJ','TT','99','88','77','AQs','AJs','ATs','KQs','KJs','QJs','JTs','T9s'),
+  'CO|UTG+1': _R('JJ','TT','99','88','77','66','AQs','AJs','ATs','KQs','KJs','QJs','JTs','T9s','98s'),
+  'CO|MP':    _R('TT','99','88','77','66','55','AQs','AJs','ATs','A9s','KQs','KJs','KTs','QJs','QTs','JTs','T9s','98s','87s'),
+  'CO|HJ':   _R('JJ','TT','99','88','77','66','AQs','AJs','ATs','KQs','KJs','QJs','JTs','T9s','98s'),
+  'BTN|UTG': _R('JJ','TT','99','88','77','AQs','AJs','ATs','KQs','KJs','QJs','JTs','T9s','98s'),
+  'BTN|UTG+1': _R('JJ','TT','99','88','77','66','AQs','AJs','ATs','KQs','KJs','QJs','JTs','T9s','98s','87s'),
+  'BTN|MP':  _R('TT','99','88','77','66','55','AQs','AJs','ATs','A9s','KQs','KJs','KTs','QJs','QTs','JTs','T9s','98s','87s','76s'),
+  'BTN|HJ':  _R('TT','99','88','77','66','55','AQs','AJs','ATs','KQs','KJs','KTs','QJs','QTs','JTs','T9s','98s','87s'),
+  'BTN|CO':  _R('TT','99','88','77','66','55','44','AJs','ATs','A9s','KQs','KJs','KTs','QJs','QTs','JTs','J9s','T9s','T8s','98s','87s','76s','65s'),
+  'BB|UTG': _R('TT','99','88','77','66','55','44','33','22','AQs','AJs','ATs','A9s','A8s','A7s','A6s','A5s','A4s','A3s','A2s','KQs','KJs','KTs','K9s','K8s','QJs','QTs','Q9s','JTs','J9s','T9s','T8s','98s','97s','87s','76s','65s','54s','AJo','ATo','KQo','KJo','QJo','JTo'),
+  'BB|UTG+1': _R('TT','99','88','77','66','55','44','33','22','AJs','ATs','A9s','A8s','A7s','A6s','A5s','A4s','A3s','A2s','KQs','KJs','KTs','K9s','K8s','QJs','QTs','Q9s','JTs','J9s','T9s','T8s','98s','97s','87s','76s','65s','54s','AJo','ATo','KQo','KJo','QJo','JTo'),
+  'BB|MP':  _R('TT','99','88','77','66','55','44','33','22','ATs','A9s','A8s','A7s','A6s','A5s','A4s','A3s','A2s','KQs','KJs','KTs','K9s','K8s','K7s','QJs','QTs','Q9s','Q8s','JTs','J9s','J8s','T9s','T8s','T7s','98s','97s','87s','86s','76s','75s','65s','54s','AJo','ATo','A9o','KQo','KJo','KTo','QJo','QTo','JTo','T9o'),
+  'BB|HJ':  _R('TT','99','88','77','66','55','44','33','22','AJs','ATs','A9s','A8s','A7s','A6s','A5s','A4s','A3s','A2s','KQs','KJs','KTs','K9s','K8s','K7s','QJs','QTs','Q9s','Q8s','JTs','J9s','J8s','T9s','T8s','T7s','98s','97s','87s','86s','76s','75s','65s','54s','AJo','ATo','A9o','KQo','KJo','KTo','QJo','QTo','JTo','T9o'),
+  'BB|CO':  _R('TT','99','88','77','66','55','44','33','22','ATs','A9s','A8s','A7s','A6s','A5s','A4s','A3s','A2s','KQs','KJs','KTs','K9s','K8s','K7s','K6s','QJs','QTs','Q9s','Q8s','Q7s','JTs','J9s','J8s','J7s','T9s','T8s','T7s','98s','97s','96s','87s','86s','85s','76s','75s','65s','64s','54s','53s','ATo','A9o','A8o','A7o','KQo','KJo','KTo','K9o','QJo','QTo','Q9o','JTo','J9o','T9o','98o','87o','76o'),
+  'BB|BTN': _R('TT','99','88','77','66','55','44','33','22','A9s','A8s','A7s','A6s','A5s','A4s','A3s','A2s','KTs','K9s','K8s','K7s','K6s','K5s','K4s','K3s','K2s','QTs','Q9s','Q8s','Q7s','Q6s','Q5s','Q4s','Q3s','Q2s','JTs','J9s','J8s','J7s','J6s','J5s','J4s','J3s','T9s','T8s','T7s','T6s','T5s','98s','97s','96s','95s','87s','86s','85s','84s','76s','75s','74s','65s','64s','63s','54s','53s','43s','ATo','A9o','A8o','A7o','A6o','A5o','A4o','A3o','A2o','KQo','KJo','KTo','K9o','K8o','K7o','K6o','K5o','QJo','QTo','Q9o','Q8o','Q7o','Q6o','JTo','J9o','J8o','J7o','T9o','T8o','T7o','98o','97o','87o','86o','76o','65o'),
+  'BB|SB':  _R('TT','99','88','77','66','55','44','33','22','A9s','A8s','A7s','A6s','A5s','A4s','A3s','A2s','KTs','K9s','K8s','K7s','K6s','K5s','K4s','K3s','K2s','QTs','Q9s','Q8s','Q7s','Q6s','Q5s','Q4s','JTs','J9s','J8s','J7s','J6s','T9s','T8s','T7s','98s','97s','87s','86s','76s','75s','65s','54s','ATo','A9o','A8o','A7o','A6o','A5o','A4o','A3o','KJo','KTo','K9o','K8o','K7o','QJo','QTo','Q9o','Q8o','JTo','J9o','J8o','T9o','T8o','98o','87o','76o'),
+  'SB|UTG': _R('TT','99','88','77','AQs','AJs','ATs','KQs','KJs','QJs','JTs','T9s'),
+  'SB|UTG+1': _R('TT','99','88','77','AQs','AJs','ATs','KQs','KJs','QJs','JTs','T9s'),
+  'SB|MP':  _R('TT','99','88','77','66','AQs','AJs','ATs','KQs','KJs','QJs','JTs','T9s','98s'),
+  'SB|HJ':  _R('TT','99','88','77','66','AQs','AJs','ATs','KQs','KJs','QJs','JTs','T9s','98s'),
+  'SB|CO':  _R('TT','99','88','77','66','55','AQs','AJs','ATs','KQs','KJs','KTs','QJs','QTs','JTs','T9s','98s','87s'),
+  'SB|BTN': _R('TT','99','88','77','66','55','44','AJs','ATs','A9s','A8s','A7s','A6s','A5s','KQs','KJs','KTs','QJs','QTs','JTs','T9s','98s','87s','76s','65s'),
+};
+
+const THREEBET_RANGES = {
+  vsUTG: _R('AA','KK','QQ','JJ','AKs','AKo','AQs','A5s','KQs'),
+  'vsUTG+1': _R('AA','KK','QQ','JJ','TT','AKs','AKo','AQs','A5s','A4s','KQs'),
+  vsMP: _R('AA','KK','QQ','JJ','TT','AKs','AKo','AQs','AQo','AJs','A5s','A4s','KQs','KJs'),
+  vsHJ:  _R('AA','KK','QQ','JJ','TT','AKs','AKo','AQs','AQo','A5s','A4s','KQs','KJs'),
+  vsCO:  _R('AA','KK','QQ','JJ','TT','99','AKs','AKo','AQs','AQo','AJs','A5s','A4s','A3s','KQs','KJs','QJs'),
+  vsBTN: _R('AA','KK','QQ','JJ','TT','99','88','AKs','AKo','AQs','AQo','AJs','AJo','ATs','A5s','A4s','A3s','A2s','KQs','KJs','KTs','QJs','QTs','JTs'),
+  vsSB:  _R('AA','KK','QQ','JJ','TT','99','AKs','AKo','AQs','AQo','AJs','ATs','A5s','A4s','KQs','KJs','QJs'),
+};
+
+const CALL_VS_3BET_RANGES = {
+  UTG: _R('JJ','TT','99','88','AKs','AQs','AJs','KQs','QJs','JTs','T9s'),
+  'UTG+1': _R('JJ','TT','99','88','77','AKs','AQs','AJs','KQs','KJs','QJs','JTs','T9s','98s'),
+  MP:  _R('JJ','TT','99','88','77','66','AKs','AQs','AJs','ATs','KQs','KJs','QJs','JTs','T9s','98s','87s'),
+  HJ:  _R('JJ','TT','99','88','77','66','AKs','AQs','AJs','ATs','KQs','KJs','KTs','QJs','QTs','JTs','T9s','98s','87s'),
+  CO:  _R('TT','99','88','77','66','55','AQs','AJs','ATs','KQs','KJs','KTs','QJs','QTs','JTs','T9s','98s','87s','76s'),
+  BTN: _R('TT','99','88','77','66','55','44','AJs','ATs','KQs','KJs','KTs','QJs','QTs','JTs','T9s','98s','87s','76s','65s'),
+  SB:  _R('TT','99','88','77','AJs','ATs','KQs','KJs','QJs','JTs','T9s'),
+  BB:  _R('99','88','77','66','55','AJs','ATs','A5s','KQs','KJs','KTs','QJs','QTs','JTs','T9s','98s','87s','76s'),
+};
+
+const FOURBET_RANGES = {
+  UTG: _R('AA','KK','QQ','AKs','AKo','A5s'),
+  'UTG+1': _R('AA','KK','QQ','AKs','AKo','A5s','A4s'),
+  MP:  _R('AA','KK','QQ','AKs','AKo','A5s','A4s'),
+  HJ:  _R('AA','KK','QQ','AKs','AKo','A5s','A4s'),
+  CO:  _R('AA','KK','QQ','AKs','AKo','A5s','A4s','AJs'),
+  BTN: _R('AA','KK','QQ','JJ','AKs','AKo','A5s','A4s','A3s','AJs'),
+  SB:  _R('AA','KK','QQ','AKs','AKo','A5s','A4s'),
+};
+
+const CALL_VS_4BET_RANGES = {
+  UTG: _R('AA','KK','QQ','JJ','AKs','AKo'),
+  'UTG+1': _R('AA','KK','QQ','JJ','AKs','AKo'),
+  MP:  _R('AA','KK','QQ','JJ','AKs','AKo'),
+  HJ:  _R('AA','KK','QQ','JJ','AKs','AKo'),
+  CO:  _R('AA','KK','QQ','JJ','TT','AKs','AKo','AQs'),
+  BTN: _R('AA','KK','QQ','JJ','TT','99','AKs','AKo','AQs','AJs'),
+  SB:  _R('AA','KK','QQ','JJ','AKs','AKo','AQs'),
+  BB:  _R('AA','KK','QQ','JJ','TT','AKs','AKo','AQs'),
+};
+
+function positionIndex(pos) {
+  const idx = POSITIONS_8.indexOf(pos);
+  return idx === -1 ? POSITIONS_8.length : idx;
+}
+
+function openingBand(opener) {
+  const idx = positionIndex(opener);
+  if (idx <= 1) return 'early';
+  if (idx <= 3) return 'middle';
+  if (idx <= 4) return 'cutoff';
+  if (idx <= 5) return 'button';
+  return 'blind';
+}
+
+function defaultIpFlatRange(opener) {
+  const band = openingBand(opener);
+  if (band === 'early') return _R('JJ','TT','99','88','77','AQs','AJs','ATs','KQs','KJs','QJs','JTs','T9s','98s');
+  if (band === 'middle') return _R('TT','99','88','77','66','55','AQs','AJs','ATs','A9s','KQs','KJs','KTs','QJs','QTs','JTs','T9s','98s','87s','76s');
+  if (band === 'cutoff') return _R('TT','99','88','77','66','55','44','AJs','ATs','A9s','A8s','KQs','KJs','KTs','QJs','QTs','JTs','J9s','T9s','T8s','98s','87s','76s','65s');
+  return _R('99','88','77','66','55','44','AJs','ATs','A9s','KQs','KJs','KTs','QJs','QTs','JTs','T9s','98s','87s','76s','65s');
+}
+
+function defaultSbFlatRange(opener) {
+  const band = openingBand(opener);
+  if (band === 'early') return _R('TT','99','88','77','AQs','AJs','ATs','KQs','KJs','QJs','JTs','T9s');
+  if (band === 'middle') return _R('TT','99','88','77','66','AQs','AJs','ATs','KQs','KJs','QJs','JTs','T9s','98s');
+  return _R('TT','99','88','77','66','55','44','AJs','ATs','A9s','A8s','A7s','A6s','A5s','KQs','KJs','KTs','QJs','QTs','JTs','T9s','98s','87s','76s','65s');
+}
+
+function defaultBbDefendRange(opener) {
+  const band = openingBand(opener);
+  if (band === 'early') return DEFEND_RANGES['BB|UTG'];
+  if (band === 'middle') return DEFEND_RANGES['BB|MP'] || DEFEND_RANGES['BB|HJ'];
+  if (band === 'cutoff') return DEFEND_RANGES['BB|CO'];
+  if (band === 'button') return DEFEND_RANGES['BB|BTN'];
+  return DEFEND_RANGES['BB|SB'];
+}
+
+function resolveDefaultDefendRange(defender, opener) {
+  if (defender === 'BB') return defaultBbDefendRange(opener) || new Set();
+  if (defender === 'SB') return defaultSbFlatRange(opener);
+  return defaultIpFlatRange(opener);
+}
+
+function resolveVillainPreflopRange(preflopAction, heroPos) {
+  if (!preflopAction) return new Set();
+  const villainPos = preflopAction.players.find(p => p !== heroPos);
+  if (!villainPos) return new Set();
+  const villainIsOpener = preflopAction.opener === villainPos;
+
+  if (preflopAction.potType === 'SRP') {
+    if (villainIsOpener) return RFI_RANGES[villainPos] || new Set();
+    const key = `${villainPos}|${preflopAction.opener}`;
+    return DEFEND_RANGES[key] || resolveDefaultDefendRange(villainPos, preflopAction.opener);
+  }
+  if (preflopAction.potType === '3BP') {
+    if (villainIsOpener) return CALL_VS_3BET_RANGES[villainPos] || new Set();
+    return THREEBET_RANGES[`vs${preflopAction.opener}`] || THREEBET_RANGES.vsMP || new Set();
+  }
+  if (preflopAction.potType === '4BP') {
+    if (villainIsOpener) return FOURBET_RANGES[villainPos] || new Set();
+    return CALL_VS_4BET_RANGES[villainPos] || new Set();
+  }
+  return new Set();
+}
+
+function expandRangeToCombos(rangeSet, deadCards) {
+  if (!rangeSet || rangeSet.size === 0) return [];
+  const excluded = new Set(deadCards.map(c => c.rank + c.suit));
+  const combos = [];
+  rangeSet.forEach(token => {
+    if (token.length === 2) {
+      const r = token[0];
+      for (let i = 0; i < SUITS.length; i++) {
+        for (let j = i + 1; j < SUITS.length; j++) {
+          const t1 = r + SUITS[i], t2 = r + SUITS[j];
+          if (!excluded.has(t1) && !excluded.has(t2))
+            combos.push([{ rank: r, suit: SUITS[i] }, { rank: r, suit: SUITS[j] }]);
+        }
+      }
+    } else if (token[2] === 's') {
+      const r1 = token[0], r2 = token[1];
+      SUITS.forEach(s => {
+        const t1 = r1 + s, t2 = r2 + s;
+        if (!excluded.has(t1) && !excluded.has(t2))
+          combos.push([{ rank: r1, suit: s }, { rank: r2, suit: s }]);
+      });
+    } else if (token[2] === 'o') {
+      const r1 = token[0], r2 = token[1];
+      for (let i = 0; i < 4; i++) {
+        for (let j = 0; j < 4; j++) {
+          if (i === j) continue;
+          const t1 = r1 + SUITS[i], t2 = r2 + SUITS[j];
+          if (!excluded.has(t1) && !excluded.has(t2))
+            combos.push([{ rank: r1, suit: SUITS[i] }, { rank: r2, suit: SUITS[j] }]);
+        }
+      }
+    }
+  });
+  return combos;
+}
+
+// ============================================================
+// 5-CARD AND 7-CARD HAND EVALUATION (for Monte Carlo)
+// ============================================================
+
+function rank5(c) {
+  const ranks = c.map(x => RANK_VAL[x.rank]).sort((a,b) => b-a);
+  const suits = c.map(x => x.suit);
+  const rc = {};
+  ranks.forEach(r => rc[r] = (rc[r] || 0) + 1);
+  const counts = Object.values(rc).sort((a,b) => b-a);
+  const distinct = Object.keys(rc).map(Number).sort((a,b) => b-a);
+  const flush = suits.every(s => s === suits[0]);
+  let straight = false, sh = 0;
+  if (distinct.length === 5) {
+    if (distinct[0] - distinct[4] === 4) { straight = true; sh = distinct[0]; }
+    else if (distinct[0] === 14 && distinct[1] === 5 && distinct[2] === 4 && distinct[3] === 3 && distinct[4] === 2) { straight = true; sh = 5; }
+  }
+  if (straight && flush) return 8e12 + sh;
+  if (counts[0] === 4) {
+    const q = Number(Object.keys(rc).find(r => rc[r] === 4));
+    const k = Number(Object.keys(rc).find(r => rc[r] === 1));
+    return 7e12 + q * 100 + k;
+  }
+  if (counts[0] === 3 && counts[1] === 2) {
+    const t = Number(Object.keys(rc).find(r => rc[r] === 3));
+    const p = Number(Object.keys(rc).find(r => rc[r] === 2));
+    return 6e12 + t * 100 + p;
+  }
+  if (flush) {
+    let s = 5e12;
+    distinct.forEach((r, i) => s += r * Math.pow(15, 4-i));
+    return s;
+  }
+  if (straight) return 4e12 + sh;
+  if (counts[0] === 3) {
+    const t = Number(Object.keys(rc).find(r => rc[r] === 3));
+    const ks = Object.keys(rc).filter(r => rc[r] === 1).map(Number).sort((a,b) => b-a);
+    return 3e12 + t * 10000 + ks[0] * 100 + ks[1];
+  }
+  if (counts[0] === 2 && counts[1] === 2) {
+    const ps = Object.keys(rc).filter(r => rc[r] === 2).map(Number).sort((a,b) => b-a);
+    const k = Number(Object.keys(rc).find(r => rc[r] === 1));
+    return 2e12 + ps[0] * 10000 + ps[1] * 100 + k;
+  }
+  if (counts[0] === 2) {
+    const p = Number(Object.keys(rc).find(r => rc[r] === 2));
+    const ks = Object.keys(rc).filter(r => rc[r] === 1).map(Number).sort((a,b) => b-a);
+    return 1e12 + p * 1000000 + ks[0] * 10000 + ks[1] * 100 + ks[2];
+  }
+  let s = 0;
+  distinct.forEach((r, i) => s += r * Math.pow(15, 4-i));
+  return s;
+}
+
+function rank7(cards) {
+  let best = 0;
+  for (let i = 0; i < 7; i++) {
+    for (let j = i + 1; j < 7; j++) {
+      const five = [];
+      for (let k = 0; k < 7; k++) if (k !== i && k !== j) five.push(cards[k]);
+      const v = rank5(five);
+      if (v > best) best = v;
+    }
+  }
+  return best;
+}
+
+// ============================================================
+// MONTE CARLO EQUITY
+// ============================================================
+
+const EQUITY_CACHE = new Map();
+const HEADS_UP_EQUITY_CACHE = new Map();
+const RESPONSE_SCORE_CACHE = new Map();
+const RESPONSE_CACHE = new Map();
+
+function cardKey(card) {
+  return `${card.rank}${card.suit}`;
+}
+
+function comboKey(combo) {
+  return combo.map(cardKey).sort().join('');
+}
+
+function equityCacheKey(heroCombo, villainCombos, board) {
+  const hero = comboKey(heroCombo);
+  const boardKey = board.map(cardKey).join('');
+  const villains = villainCombos.map(comboKey).sort().join(',');
+  return `${hero}|${boardKey}|${villains}`;
+}
+
+function rememberEquity(key, value) {
+  if (EQUITY_CACHE.size >= EQUITY_CACHE_LIMIT) {
+    const firstKey = EQUITY_CACHE.keys().next().value;
+    EQUITY_CACHE.delete(firstKey);
+  }
+  EQUITY_CACHE.set(key, value);
+  return value;
+}
+
+function responseCacheKey(heroCombo, villainCombos, board, betSizePct, isFacingHeroRaise) {
+  const hero = heroCombo ? comboKey(heroCombo) : 'range-neutral';
+  const boardKey = board.map(cardKey).join('');
+  const villains = villainCombos.map(comboKey).sort().join(',');
+  return `${hero}|${boardKey}|${villains}|${betSizePct}|${isFacingHeroRaise ? 'raise' : 'bet'}`;
+}
+
+function responseScoreCacheKey(heroCombo, villainCombos, board) {
+  const hero = heroCombo ? comboKey(heroCombo) : 'range-neutral';
+  const boardKey = board.map(cardKey).join('');
+  const villains = villainCombos.map(comboKey).sort().join(',');
+  return `${hero}|${boardKey}|${villains}`;
+}
+
+function rememberResponse(key, value) {
+  if (RESPONSE_CACHE.size >= RESPONSE_CACHE_LIMIT) {
+    const firstKey = RESPONSE_CACHE.keys().next().value;
+    RESPONSE_CACHE.delete(firstKey);
+  }
+  RESPONSE_CACHE.set(key, value);
+  return value;
+}
+
+function rememberResponseScores(key, value) {
+  if (RESPONSE_SCORE_CACHE.size >= RESPONSE_SCORE_CACHE_LIMIT) {
+    const firstKey = RESPONSE_SCORE_CACHE.keys().next().value;
+    RESPONSE_SCORE_CACHE.delete(firstKey);
+  }
+  RESPONSE_SCORE_CACHE.set(key, value);
+  return value;
+}
+
+function rememberHeadsUpEquity(key, value) {
+  if (HEADS_UP_EQUITY_CACHE.size >= HEADS_UP_EQUITY_CACHE_LIMIT) {
+    const firstKey = HEADS_UP_EQUITY_CACHE.keys().next().value;
+    HEADS_UP_EQUITY_CACHE.delete(firstKey);
+  }
+  HEADS_UP_EQUITY_CACHE.set(key, value);
+  return value;
+}
+
+function monteCarloEquity(heroCombo, villainCombos, board, trials = 250) {
+  if (villainCombos.length === 0) return { equity: 0.5, samples: 0 };
+  const dead = new Set([...heroCombo, ...board].map(c => c.rank + c.suit));
+  const fullDeck = [];
+  RANKS.forEach(r => SUITS.forEach(s => { if (!dead.has(r + s)) fullDeck.push({ rank: r, suit: s }); }));
+  const need = 5 - board.length;
+  let wins = 0, ties = 0;
+  for (let t = 0; t < trials; t++) {
+    const vc = villainCombos[Math.floor(Math.random() * villainCombos.length)];
+    const vk1 = vc[0].rank + vc[0].suit, vk2 = vc[1].rank + vc[1].suit;
+    const deck = [];
+    for (let i = 0; i < fullDeck.length; i++) {
+      const c = fullDeck[i];
+      const tk = c.rank + c.suit;
+      if (tk !== vk1 && tk !== vk2) deck.push(c);
+    }
+    const runout = [];
+    for (let i = 0; i < need; i++) {
+      const idx = Math.floor(Math.random() * deck.length);
+      runout.push(deck[idx]);
+      deck.splice(idx, 1);
+    }
+    const finalBoard = [...board, ...runout];
+    const hs = rank7([...heroCombo, ...finalBoard]);
+    const vs = rank7([...vc, ...finalBoard]);
+    if (hs > vs) wins++;
+    else if (hs === vs) ties++;
+  }
+  return { equity: (wins + ties * 0.5) / trials, samples: trials, mode: 'mc' };
+}
+
+function chooseCount(n, k) {
+  if (k < 0 || k > n) return 0;
+  if (k === 0 || k === n) return 1;
+  let out = 1;
+  for (let i = 1; i <= k; i++) out = (out * (n - k + i)) / i;
+  return out;
+}
+
+function makeDeckExcluding(keys) {
+  const deck = [];
+  RANKS.forEach(rank => SUITS.forEach(suit => {
+    if (!keys.has(rank + suit)) deck.push({ rank, suit });
+  }));
+  return deck;
+}
+
+function scoreShowdown(heroCombo, villainCombo, finalBoard) {
+  const heroScore = rank7([...heroCombo, ...finalBoard]);
+  const villainScore = rank7([...villainCombo, ...finalBoard]);
+  if (heroScore > villainScore) return 1;
+  if (heroScore === villainScore) return 0.5;
+  return 0;
+}
+
+function exactEquity(heroCombo, villainCombos, board) {
+  const baseDead = new Set([...heroCombo, ...board].map(c => c.rank + c.suit));
+  const need = 5 - board.length;
+  let total = 0;
+  let equityPoints = 0;
+
+  for (const villainCombo of villainCombos) {
+    const v1 = villainCombo[0].rank + villainCombo[0].suit;
+    const v2 = villainCombo[1].rank + villainCombo[1].suit;
+    if (baseDead.has(v1) || baseDead.has(v2)) continue;
+
+    const dead = new Set([...baseDead, v1, v2]);
+    const deck = makeDeckExcluding(dead);
+
+    if (need === 0) {
+      equityPoints += scoreShowdown(heroCombo, villainCombo, board);
+      total += 1;
+    } else if (need === 1) {
+      for (let i = 0; i < deck.length; i++) {
+        equityPoints += scoreShowdown(heroCombo, villainCombo, [...board, deck[i]]);
+        total += 1;
+      }
+    } else {
+      for (let i = 0; i < deck.length - 1; i++) {
+        for (let j = i + 1; j < deck.length; j++) {
+          equityPoints += scoreShowdown(heroCombo, villainCombo, [...board, deck[i], deck[j]]);
+          total += 1;
+        }
+      }
+    }
+  }
+
+  return { equity: total ? equityPoints / total : 0.5, samples: total, mode: 'exact' };
+}
+
+function comboVsComboEquity(heroCombo, villainCombo, board) {
+  const cacheKey = `hu|${comboKey(heroCombo)}|${comboKey(villainCombo)}|${board.map(cardKey).join('')}`;
+  if (HEADS_UP_EQUITY_CACHE.has(cacheKey)) return HEADS_UP_EQUITY_CACHE.get(cacheKey);
+
+  const dead = new Set([...heroCombo, ...villainCombo, ...board].map(c => c.rank + c.suit));
+  const deck = makeDeckExcluding(dead);
+  const need = 5 - board.length;
+  const totalRunouts = need === 0 ? 1 : chooseCount(deck.length, need);
+  const sampleEvery = totalRunouts > HEADS_UP_RUNOUT_SAMPLES
+    ? Math.max(1, Math.floor(totalRunouts / HEADS_UP_RUNOUT_SAMPLES))
+    : 1;
+  let seen = 0;
+  let used = 0;
+  let equityPoints = 0;
+
+  const addRunout = (runout) => {
+    if (seen % sampleEvery === 0 && used < HEADS_UP_RUNOUT_SAMPLES) {
+      equityPoints += scoreShowdown(heroCombo, villainCombo, [...board, ...runout]);
+      used += 1;
+    }
+    seen += 1;
+  };
+
+  if (need === 0) {
+    addRunout([]);
+  } else if (need === 1) {
+    for (let i = 0; i < deck.length; i++) addRunout([deck[i]]);
+  } else {
+    for (let i = 0; i < deck.length - 1; i++) {
+      for (let j = i + 1; j < deck.length; j++) addRunout([deck[i], deck[j]]);
+    }
+  }
+
+  return rememberHeadsUpEquity(cacheKey, used ? equityPoints / used : 0.5);
+}
+
+function calculateEquity(heroCombo, villainCombos, board) {
+  if (villainCombos.length === 0) return { equity: 0.5, samples: 0, mode: 'none' };
+  const cacheKey = equityCacheKey(heroCombo, villainCombos, board);
+  if (EQUITY_CACHE.has(cacheKey)) return EQUITY_CACHE.get(cacheKey);
+  const need = 5 - board.length;
+  const dead = new Set([...heroCombo, ...board].map(c => c.rank + c.suit));
+  const deckSizeAfterHeroBoard = 52 - dead.size - 2;
+  const runoutsPerCombo = need === 0 ? 1 : chooseCount(deckSizeAfterHeroBoard, need);
+  const exactEvalCount = villainCombos.length * runoutsPerCombo;
+  if (need <= 2 && exactEvalCount <= EQUITY_EXACT_EVAL_LIMIT) {
+    return rememberEquity(cacheKey, exactEquity(heroCombo, villainCombos, board));
+  }
+  return rememberEquity(cacheKey, monteCarloEquity(heroCombo, villainCombos, board, EQUITY_MONTE_CARLO_TRIALS));
+}
+
+// ============================================================
+// RANGE NARROWING (based on villain's prior-street actions)
+// ============================================================
+
+function boardThreatSuit(board) {
+  const suitCounts = {};
+  board.forEach(card => { suitCounts[card.suit] = (suitCounts[card.suit] || 0) + 1; });
+  let bestSuit = null;
+  let bestCount = 0;
+  Object.entries(suitCounts).forEach(([suit, count]) => {
+    if (count > bestCount) {
+      bestSuit = suit;
+      bestCount = count;
+    }
+  });
+  return bestCount >= 2 ? bestSuit : null;
+}
+
+function scoreVillainActionCombo(combo, board, texture, threatSuit = boardThreatSuit(board)) {
+  const e = evalHand(combo, board);
+  const ranks = combo.map(card => RANK_VAL[card.rank]);
+  const overcards = ranks.filter(rank => rank > texture.highCard).length;
+  const nutFlushBlocker = threatSuit && combo.some(card => card.rank === 'A' && card.suit === threatSuit);
+  const highCardBlocker = ranks.includes(14) ? 2.8 : ranks.includes(13) ? 1.4 : 0;
+  const blockerScore = highCardBlocker + (nutFlushBlocker ? 3.4 : 0);
+  const drawScore =
+    (e.flushDraw ? 11 : 0) +
+    (e.oesd ? 10 : 0) +
+    (e.gutshot ? 4.2 : 0) +
+    (e.backdoorFD ? 1.8 : 0);
+  const lowShowdownScore = Math.max(0, 55 - e.strength) * 0.10;
+  const madeHandPenalty = e.strength >= 55 ? -3.5 : 0;
+
+  return {
+    c: combo,
+    e,
+    valueScore: e.strength + drawScore * 0.18 + blockerScore * 0.35 + overcards * 0.8,
+    continueScore: e.strength + drawScore * 0.65 + blockerScore * 0.35 + overcards * 0.7,
+    semiBluffScore: drawScore * 2.5 + blockerScore + overcards * 1.3 + Math.max(0, 70 - e.strength) * 0.06,
+    bluffScore: blockerScore * 1.8 + drawScore * 0.9 + overcards * 1.2 + lowShowdownScore + madeHandPenalty,
+    isSemiBluff: (e.flushDraw || e.oesd || e.gutshot || (e.backdoorFD && overcards > 0)) && e.strength < 82,
+    isBluffCandidate: e.strength < 48 || e.flushDraw || e.oesd || e.gutshot || blockerScore >= 2.5,
+  };
+}
+
+function actionComboCount(total, pct, min = 0) {
+  return Math.max(min, Math.min(total, Math.round(total * pct)));
+}
+
+function addTopActionCombos(keepers, scored, count, scorer, predicate = () => true) {
+  if (count <= 0) return;
+  [...scored]
+    .filter(item => !keepers.has(item.c) && predicate(item))
+    .sort((a, b) => scorer(b) - scorer(a))
+    .slice(0, count)
+    .forEach(item => keepers.add(item.c));
+}
+
+function narrowVillainCombos(combos, board, villainAction) {
+  if (!villainAction || villainAction.type === 'check' || combos.length === 0) return combos;
+  const texture = getBoardTexture(board);
+  const threatSuit = boardThreatSuit(board);
+  const scored = combos.map(c => scoreVillainActionCombo(c, board, texture, threatSuit));
+  const byValue = [...scored].sort((a, b) => b.valueScore - a.valueScore);
+  const n = scored.length;
+
+  if (villainAction.type === 'bet') {
+    const size = Number(villainAction.size) || 50;
+    let valuePct, drawPct, bluffPct;
+    if (size <= 33)      { valuePct = 0.54; drawPct = 0.03; bluffPct = 0.06; }
+    else if (size <= 50) { valuePct = 0.38; drawPct = 0.07; bluffPct = 0.09; }
+    else if (size <= 75) { valuePct = 0.27; drawPct = 0.10; bluffPct = 0.11; }
+    else                 { valuePct = 0.18; drawPct = 0.12; bluffPct = 0.13; }
+
+    const wetness = clamp(texture.wetness || 0, -1, 5);
+    valuePct += wetness >= 3 ? 0.015 : 0;
+    drawPct += Math.max(0, wetness) * 0.008;
+    bluffPct += texture.paired ? 0.015 : 0;
+    if (texture.monotone) {
+      valuePct += 0.02;
+      drawPct += 0.02;
+      bluffPct -= 0.025;
+    }
+
+    const keepers = new Set();
+    addTopActionCombos(keepers, scored, actionComboCount(n, clamp(valuePct, 0.12, 0.58), 1), x => x.valueScore);
+    addTopActionCombos(keepers, scored, actionComboCount(n, clamp(drawPct, 0.02, 0.18)), x => x.semiBluffScore, x => x.isSemiBluff);
+    addTopActionCombos(keepers, scored, actionComboCount(n, clamp(bluffPct, 0.02, 0.16)), x => x.bluffScore, x => x.isBluffCandidate);
+    return Array.from(keepers);
+  }
+  if (villainAction.type === 'raise') {
+    const keepers = new Set();
+    addTopActionCombos(keepers, scored, actionComboCount(n, 0.12, 1), x => x.valueScore);
+    addTopActionCombos(keepers, scored, actionComboCount(n, 0.06), x => x.semiBluffScore, x => x.isSemiBluff);
+    addTopActionCombos(keepers, scored, actionComboCount(n, 0.04), x => x.bluffScore, x => x.isBluffCandidate);
+    return Array.from(keepers);
+  }
+  if (villainAction.type === 'threebet') {
+    const keepers = new Set();
+    addTopActionCombos(keepers, scored, actionComboCount(n, 0.07, 1), x => x.valueScore);
+    addTopActionCombos(keepers, scored, actionComboCount(n, 0.035), x => x.bluffScore, x => x.isBluffCandidate);
+    return Array.from(keepers);
+  }
+  if (villainAction.type === 'capped-raise') {
+    const start = Math.floor(n * 0.05);
+    const end = Math.floor(n * 0.30);
+    return byValue.slice(start, end).map(x => x.c);
+  }
+  if (villainAction.type === 'call') {
+    const keepers = new Set();
+    const nutCut = new Set(byValue.slice(0, actionComboCount(n, 0.10)).map(x => x.c));
+    addTopActionCombos(
+      keepers,
+      scored,
+      actionComboCount(n, 0.58, 1),
+      x => x.continueScore,
+      x => !nutCut.has(x.c) && (x.e.strength >= 24 || x.isSemiBluff)
+    );
+    return Array.from(keepers);
+  }
+  if (villainAction.type === 'capped-bet') {
+    const keepers = new Set();
+    const start = Math.floor(n * 0.06);
+    const end = Math.floor(n * 0.36);
+    byValue.slice(start, end).forEach(x => keepers.add(x.c));
+    addTopActionCombos(keepers, scored, actionComboCount(n, 0.04), x => x.semiBluffScore, x => x.isSemiBluff);
+    return Array.from(keepers);
+  }
+  return combos;
+}
+
+function parseVillainStrongestAction(actionLine, heroIP) {
+  if (!actionLine) return null;
+  const id = actionLine.id;
+  const size = actionLine.betSize;
+  if (heroIP) {
+    if (id === 'ip-check-check') return { type: 'check' };
+    // 3-bet patterns (check BEFORE 2-bet patterns)
+    if (id.includes('check-hero-bet') && id.includes('checkraise-3bet-call'))
+      return { type: 'capped-raise', size }; // V CR'd, got 3-bet, called -> strong but no nuts
+    if (id.includes('villain-bet') && id.includes('hero-raise-3bet-call'))
+      return { type: 'threebet', size };     // V bet, got raised, 3-bet -> very polar
+    // 2-bet patterns
+    if (id.includes('check-hero-bet') && id.includes('checkraise-call')) return { type: 'raise', size };
+    if (id.includes('check-hero-bet') && id.endsWith('-call')) return { type: 'call', size };
+    if (id.includes('villain-bet') && id.includes('hero-raise-call')) return { type: 'capped-bet', size };
+    if (id.includes('villain-bet')) return { type: 'bet', size };
+  } else {
+    if (id === 'oop-check-check') return { type: 'check' };
+    // 3-bet patterns
+    if (id.includes('hero-check-villain-bet') && id.includes('checkraise-3bet-call'))
+      return { type: 'threebet', size };     // V bet, got CR'd, 3-bet -> very polar
+    if (id.includes('hero-bet') && id.includes('villain-raise-3bet-call'))
+      return { type: 'capped-raise', size }; // V raised, got 3-bet, called -> strong but no nuts
+    // 2-bet patterns
+    if (id.includes('hero-check-villain-bet') && id.includes('checkraise-call')) return { type: 'capped-bet', size };
+    if (id.includes('hero-check-villain-bet')) return { type: 'bet', size };
+    if (id.includes('hero-bet') && id.includes('villain-raise-call')) return { type: 'raise', size };
+    if (id.includes('hero-bet') && id.endsWith('-villain-call')) return { type: 'call', size };
+  }
+  return null;
+}
+
+function getNarrowedVillainCombos(ctx) {
+  // Single source of truth for villain's range at the current node.
+  // Applies preflop range + prior-street narrowing + CURRENT decision narrowing.
+  const dead = [...(ctx.combo || []), ...(ctx.boardCards || [])];
+  let combos = expandRangeToCombos(resolveVillainPreflopRange(ctx.preflopAction, ctx.heroPos), dead);
+  if (combos.length === 0) return [];
+
+  if (ctx.flopAction && ctx.boardCards.length >= 3) {
+    combos = narrowVillainCombos(combos, ctx.boardCards.slice(0, 3), parseVillainStrongestAction(ctx.flopAction, ctx.heroIP));
+  }
+  if (ctx.turnAction && ctx.boardCards.length >= 4) {
+    combos = narrowVillainCombos(combos, ctx.boardCards.slice(0, 4), parseVillainStrongestAction(ctx.turnAction, ctx.heroIP));
+  }
+
+  // Current-street narrowing implied by the decision node hero is at.
+  if (ctx.currentDecision) {
+    if (ctx.currentDecision.type === 'facing-bet') {
+      combos = narrowVillainCombos(combos, ctx.boardCards, { type: 'bet', size: ctx.currentDecision.betSize });
+    } else if (ctx.currentDecision.type === 'facing-raise') {
+      combos = narrowVillainCombos(combos, ctx.boardCards, { type: 'raise', size: ctx.currentDecision.initialBetSize });
+    } else if (ctx.currentDecision.type === 'facing-3bet') {
+      combos = narrowVillainCombos(combos, ctx.boardCards, { type: 'threebet', size: ctx.currentDecision.initialBetSize });
+    }
+  }
+  return combos;
+}
+
+function describeVillainRange(ctx) {
+  const villain = ctx.villainPos || 'Villain';
+  const decision = ctx.currentDecision;
+  if (!decision) return `${villain} preflop range`;
+  if (decision.type === 'facing-bet') {
+    const size = decision.betSize ? `${decision.betSize}% pot bet` : 'bet';
+    if (!ctx.heroIP && decision.id?.includes('hero-check')) {
+      return `${villain} ${size} range after Hero checks`;
+    }
+    return `${villain} ${size} range`;
+  }
+  if (decision.type === 'facing-raise') return `${villain} raise range`;
+  if (decision.type === 'facing-3bet') return `${villain} 3-bet range`;
+  return `${villain} preflop range`;
+}
+
+function computeEquityContext(ctx) {
+  const rangeCtx = computeRangeContext(ctx);
+  if (rangeCtx.villainCombos.length === 0) return rangeCtx;
+  const { equity, samples, mode } = calculateEquity(ctx.combo, rangeCtx.villainCombos, ctx.boardCards);
+  return { ...rangeCtx, equity, samples, mode };
+}
+
+function computeRangeContext(ctx) {
+  if (!ctx.preflopAction || !ctx.combo || !ctx.boardCards || ctx.boardCards.length < 3) {
+    return { equity: null, vCount: 0, villainCombos: [], rangeLabel: describeVillainRange(ctx) };
+  }
+  const combos = getNarrowedVillainCombos(ctx);
+  if (combos.length === 0) return { equity: null, vCount: 0, villainCombos: [], rangeLabel: describeVillainRange(ctx) };
+  return { equity: null, vCount: combos.length, samples: 0, mode: 'range-only', villainCombos: combos, rangeLabel: describeVillainRange(ctx) };
+}
+
+// ============================================================
+// RECOMMENDATION ENGINE
+// ============================================================
+
+function clamp(value, min = 0, max = 100) {
+  return Math.min(max, Math.max(min, value));
+}
+
+function formatBB(value) {
+  const rounded = Math.round(value * 10) / 10;
+  return Number.isInteger(rounded) ? `${rounded}` : `${rounded.toFixed(1)}`;
+}
+
+function openingBetBB(ctx, sizePct) {
+  return Math.max(0.1, Math.min(ctx.stackBB, ctx.potBB * (sizePct / 100)));
+}
+
+function getFacingBetGeometry(ctx) {
+  const sizePct = ctx.currentDecision.betSize || 50;
+  const villainBet = openingBetBB(ctx, sizePct);
+  const raiseTo = Math.min(ctx.stackBB, villainBet * POSTFLOP_RAISE_MULTIPLIER);
+  const heroRaiseAdd = Math.max(0, raiseTo - villainBet);
+  const villainCallAdd = Math.max(0, raiseTo - villainBet);
+  return {
+    sizePct,
+    villainBet,
+    callAmount: villainBet,
+    finalPotIfCall: ctx.potBB + 2 * villainBet,
+    raiseTo,
+    heroRaiseAdd,
+    villainCallAdd,
+    potAfterHeroRaise: ctx.potBB + villainBet + raiseTo,
+    finalPotIfRaiseCalled: ctx.potBB + 2 * raiseTo,
+  };
+}
+
+function getFacingRaiseGeometry(ctx) {
+  const sizePct = ctx.currentDecision.initialBetSize || ctx.currentDecision.betSize || 50;
+  const openBet = openingBetBB(ctx, sizePct);
+  const heroCurrent = openBet;
+  const villainRaiseTo = Math.min(ctx.stackBB, openBet * POSTFLOP_RAISE_MULTIPLIER);
+  const hero3BetTo = Math.min(ctx.stackBB, openBet * POSTFLOP_3BET_MULTIPLIER);
+  const callAmount = Math.max(0, villainRaiseTo - heroCurrent);
+  const hero3BetAdd = Math.max(0, hero3BetTo - heroCurrent);
+  const villainCallAdd = Math.max(0, hero3BetTo - villainRaiseTo);
+  return {
+    sizePct,
+    openBet,
+    heroCurrent,
+    villainRaiseTo,
+    hero3BetTo,
+    callAmount,
+    hero3BetAdd,
+    villainCallAdd,
+    potAtDecision: ctx.potBB + heroCurrent + villainRaiseTo,
+    finalPotIfCall: ctx.potBB + 2 * villainRaiseTo,
+    finalPotIf3BetCalled: ctx.potBB + 2 * hero3BetTo,
+  };
+}
+
+function getFacing3BetGeometry(ctx) {
+  const sizePct = ctx.currentDecision.initialBetSize || 50;
+  const openBet = openingBetBB(ctx, sizePct);
+  const heroRaiseTo = Math.min(ctx.stackBB, openBet * POSTFLOP_RAISE_MULTIPLIER);
+  const villain3BetTo = Math.min(ctx.stackBB, openBet * POSTFLOP_3BET_MULTIPLIER);
+  const callAmount = Math.max(0, villain3BetTo - heroRaiseTo);
+  const heroJamDelta = Math.max(0, ctx.stackBB - heroRaiseTo);
+  const villainJamCallDelta = Math.max(0, ctx.stackBB - villain3BetTo);
+  return {
+    sizePct,
+    openBet,
+    heroRaiseTo,
+    villain3BetTo,
+    callAmount,
+    heroJamDelta,
+    villainJamCallDelta,
+    potAtDecision: ctx.potBB + heroRaiseTo + villain3BetTo,
+    finalPotIfCall: ctx.potBB + 2 * villain3BetTo,
+    finalPotIfJamCalled: ctx.potBB + heroRaiseTo + villain3BetTo + heroJamDelta + villainJamCallDelta,
+  };
+}
+
+function colorForAction(name) {
+  const lower = name.toLowerCase();
+  if (lower.includes('fold')) return ACTION_COLORS.fold;
+  if (lower.includes('call')) return ACTION_COLORS.call;
+  if (lower.includes('check')) return ACTION_COLORS.check;
+  if (lower.includes('raise')) return ACTION_COLORS.raise;
+  return ACTION_COLORS.bet;
+}
+
+function normalizeActions(actions) {
+  const cleaned = actions.map(action => ({
+    ...action,
+    pct: Math.max(0, Number(action.pct) || 0),
+    color: action.color || colorForAction(action.name),
+  }));
+  const total = cleaned.reduce((sum, action) => sum + action.pct, 0);
+  if (total <= 0) return cleaned.map(action => ({ ...action, pct: 0 }));
+
+  const normalized = cleaned.map(action => ({
+    ...action,
+    pct: Math.round((action.pct / total) * 100),
+  }));
+  const diff = 100 - normalized.reduce((sum, action) => sum + action.pct, 0);
+  if (diff !== 0) {
+    let target = 0;
+    normalized.forEach((action, idx) => {
+      if (action.pct > normalized[target].pct) target = idx;
+    });
+    normalized[target] = { ...normalized[target], pct: normalized[target].pct + diff };
+  }
+  return normalized;
+}
+
+function cardToken(card) {
+  return `${card.rank}${card.suit}`;
+}
+
+function cardsToToken(cards) {
+  return cards.map(cardToken).join('');
+}
+
+function buildGtoNodeKey(ctx) {
+  const parts = [
+    '8max-hu',
+    ctx.street,
+    `${ctx.heroPos}-vs-${ctx.villainPos}`,
+    ctx.preflopAction?.id || 'no-preflop-line',
+    ctx.flopAction?.id || 'no-flop-line',
+    ctx.turnAction?.id || 'no-turn-line',
+    cardsToToken(ctx.boardCards),
+    cardsToToken(ctx.combo),
+    ctx.currentDecision?.id || 'no-decision',
+  ];
+  return parts.join('|');
+}
+
+function comboNotation(combo) {
+  if (!Array.isArray(combo) || combo.length !== 2) return 'unknown-hand';
+  const [a, b] = combo;
+  const first = RANK_VAL[a.rank] >= RANK_VAL[b.rank] ? a : b;
+  const second = first === a ? b : a;
+  if (first.rank === second.rank) return `${first.rank}${second.rank}`;
+  return `${first.rank}${second.rank}${first.suit === second.suit ? 's' : 'o'}`;
+}
+
+function boardSuitClass(board) {
+  const suitCounts = {};
+  board.forEach(card => { suitCounts[card.suit] = (suitCounts[card.suit] || 0) + 1; });
+  const maxSuit = Math.max(0, ...Object.values(suitCounts));
+  if (maxSuit >= 3) return 'monotone';
+  if (maxSuit === 2) return 'two-tone';
+  return 'rainbow';
+}
+
+function boardPairClass(board) {
+  const rankCounts = {};
+  board.forEach(card => { rankCounts[card.rank] = (rankCounts[card.rank] || 0) + 1; });
+  const maxPair = Math.max(0, ...Object.values(rankCounts));
+  if (maxPair >= 3) return 'trips';
+  if (maxPair === 2) return 'paired';
+  return 'unpaired';
+}
+
+function boardHighCardClass(highCard) {
+  if (highCard >= 14) return 'a-high';
+  if (highCard >= 13) return 'k-high';
+  if (highCard >= 12) return 'q-high';
+  if (highCard >= 10) return 'broadway-high';
+  return 'low-high';
+}
+
+function boardWetnessClass(texture) {
+  if (texture.wetness >= 4) return 'wet';
+  if (texture.wetness >= 2) return 'dynamic';
+  return 'dry';
+}
+
+function boardConnectedClass(texture) {
+  if (texture.connected >= 3) return 'very-connected';
+  if (texture.connected >= 2) return 'connected';
+  if (texture.connected === 1) return 'semi-connected';
+  return 'disconnected';
+}
+
+function buildBoardClass(board) {
+  if (!Array.isArray(board) || board.length < 3) return 'no-board';
+  const texture = getBoardTexture(board);
+  return [
+    board.length === 3 ? 'flop' : board.length === 4 ? 'turn' : 'river',
+    boardHighCardClass(texture.highCard),
+    boardSuitClass(board),
+    boardPairClass(board),
+    boardConnectedClass(texture),
+    boardWetnessClass(texture),
+  ].join('-');
+}
+
+function streetActionClass(action) {
+  if (!action) return 'none';
+  if (action.threeBet) return `threebet-${action.betSize || action.initialBetSize || 'x'}-call`;
+  if (action.raised) return `raise-${action.betSize || action.initialBetSize || 'x'}-call`;
+  if (action.betSize) return `bet-${action.betSize}-call`;
+  if (action.type === 'check-check') return 'check-check';
+  return action.id || 'custom-action';
+}
+
+function decisionClass(decision) {
+  if (!decision) return 'no-decision';
+  if (decision.type === 'facing-bet') return `facing-bet-${decision.betSize || 'x'}`;
+  if (decision.type === 'facing-raise') return `facing-raise-${decision.initialBetSize || 'x'}`;
+  if (decision.type === 'facing-3bet') return `facing-3bet-${decision.initialBetSize || 'x'}`;
+  return decision.type || decision.id || 'decision';
+}
+
+function buildAbstractSpotKey(ctx) {
+  const initiative = ctx.preflopAction?.aggressor === ctx.heroPos ? 'hero-pfa' : 'villain-pfa';
+  const potType = ctx.preflopAction?.potType || 'unknown-pot';
+  const parts = [
+    '8max-hu-common',
+    ctx.street,
+    potType,
+    ctx.heroIP ? 'hero-ip' : 'hero-oop',
+    initiative,
+    `${ctx.heroPos}-vs-${ctx.villainPos}`,
+    streetActionClass(ctx.flopAction),
+    streetActionClass(ctx.turnAction),
+    buildBoardClass(ctx.boardCards),
+    comboNotation(ctx.combo),
+    decisionClass(ctx.currentDecision),
+  ];
+  return parts.join('|');
+}
+
+function normalizeSolverNode(node, nodeKey, sourceLabelOverride = null, abstractKey = null) {
+  const rawActions = Array.isArray(node) ? node : node?.actions;
+  if (!Array.isArray(rawActions) || rawActions.length === 0) return null;
+
+  const actions = normalizeActions(rawActions.map(action => {
+    const rawPct = action.pct ?? action.frequency ?? action.freq ?? action.strategy ?? action.weight ?? 0;
+    const size = action.sizePct ?? action.size;
+    return {
+      name: action.name || action.action || action.label || 'Action',
+      pct: Number(rawPct) || 0,
+      detail: action.detail || (size ? `${size}% pot` : 'solver frequency'),
+      color: action.color,
+    };
+  }));
+
+  return {
+    type: 'solver-node',
+    source: 'exact',
+    sourceLabel: sourceLabelOverride || (node?.solver ? `Exact GTO - ${node.solver}` : 'Exact GTO solver node'),
+    confidenceLabel: 'Exact solved spot',
+    nodeLabel: node?.label || node?.node || nodeKey,
+    nodeKey,
+    abstractKey,
+    actions,
+  };
+}
+
+function lookupSolverNode(nodeKey, abstractKey = null) {
+  if (GTO_NODE_LIBRARY[nodeKey]) {
+    return { node: GTO_NODE_LIBRARY[nodeKey], sourceLabel: 'Exact GTO - built-in node' };
+  }
+  if (typeof window !== 'undefined' && window.GTO_SOLVER_NODES?.[nodeKey]) {
+    return { node: window.GTO_SOLVER_NODES[nodeKey], sourceLabel: 'Exact GTO - external node' };
+  }
+  if (abstractKey && PRESOLVED_COMMON_LIBRARY[abstractKey]) {
+    return { node: PRESOLVED_COMMON_LIBRARY[abstractKey], sourceLabel: 'Pre-solved common spot - built-in library' };
+  }
+  if (typeof window !== 'undefined' && abstractKey && window.PRESOLVED_GTO_LIBRARY?.[abstractKey]) {
+    return { node: window.PRESOLVED_GTO_LIBRARY[abstractKey], sourceLabel: 'Pre-solved common spot - external library' };
+  }
+  return null;
+}
+
+function parseSolverNodeJson(raw) {
+  if (!raw.trim()) return { node: null, error: null };
+  try {
+    const parsed = JSON.parse(raw);
+    if (!parsed || typeof parsed !== 'object') return { node: null, error: 'Expected solver node JSON.' };
+    const hasSingleNode = Array.isArray(parsed) || Array.isArray(parsed.actions);
+    const hasNodeMap = parsed.nodes || parsed.abstractNodes || parsed.abstract ||
+      Object.values(parsed).some(value => Array.isArray(value?.actions));
+    if (!hasSingleNode && !hasNodeMap) {
+      return { node: null, error: 'Expected an actions array, exact node map, or abstract common-spot map.' };
+    }
+    return { node: parsed, error: null };
+  } catch (err) {
+    return { node: null, error: 'Solver JSON is not valid yet.' };
+  }
+}
+
+function resolveInlineSolverNode(inlineSolverData, nodeKey, abstractKey = null) {
+  if (!inlineSolverData) return null;
+  if (Array.isArray(inlineSolverData) || Array.isArray(inlineSolverData.actions)) return inlineSolverData;
+  if (inlineSolverData.nodeKey === nodeKey && Array.isArray(inlineSolverData.actions)) return inlineSolverData;
+  if (inlineSolverData.nodes?.[nodeKey]) return inlineSolverData.nodes[nodeKey];
+  if (abstractKey && inlineSolverData.abstractNodes?.[abstractKey]) return inlineSolverData.abstractNodes[abstractKey];
+  if (abstractKey && inlineSolverData.abstract?.[abstractKey]) return inlineSolverData.abstract[abstractKey];
+  if (inlineSolverData[nodeKey]) return inlineSolverData[nodeKey];
+  if (abstractKey && inlineSolverData[abstractKey]) return inlineSolverData[abstractKey];
+  return null;
+}
+
+// ============================================================
+// SOLVER-LIKE STRATEGY ESTIMATOR
+// ============================================================
+// Equity is calculated separately for study context. The fallback strategy below
+// is intentionally node/range driven: preflop path, position, pot type, board
+// class, SPR, hand class, blockers, and range/nut advantage shape frequencies.
+
+function rankValues(board) {
+  return board.map(card => RANK_VAL[card.rank]).sort((a, b) => b - a);
+}
+
+function countBroadways(board) {
+  return board.filter(card => RANK_VAL[card.rank] >= 10).length;
+}
+
+function classifyBoardTexture(board) {
+  const texture = getBoardTexture(board);
+  const ranks = rankValues(board);
+  const high = ranks[0] || 0;
+  const low = ranks[ranks.length - 1] || 0;
+  const broadways = countBroadways(board);
+  const paired = texture.paired;
+  const monotone = texture.monotone;
+  const twoTone = texture.twoTone;
+  const dry = !paired && !monotone && texture.connected <= 1 && texture.wetness <= 1;
+  const dryAHigh = dry && high === 14;
+  const dryKHigh = dry && high === 13;
+  const twoToneBroadway = twoTone && broadways >= 2;
+  const lowConnected = !paired && texture.connected >= 1 && high <= 8;
+  const middleConnected = !paired && texture.connected >= 1 && high >= 9 && high <= 11;
+  const highConnected = !paired && (texture.connected >= 2 || (texture.connected >= 1 && broadways >= 2)) && high >= 11;
+  const dynamicWetBoard = monotone || twoToneBroadway || (twoTone && texture.connected >= 1) || texture.connected >= 2;
+
+  let primary = 'neutral';
+  if (paired) primary = 'paired';
+  else if (monotone) primary = 'monotone';
+  else if (dryAHigh) primary = 'dry A-high';
+  else if (dryKHigh) primary = 'dry K-high';
+  else if (twoToneBroadway) primary = 'two-tone broadway';
+  else if (lowConnected) primary = 'low connected';
+  else if (middleConnected) primary = 'middle connected';
+  else if (highConnected) primary = 'high connected';
+  else if (dynamicWetBoard) primary = 'dynamic wet board';
+
+  return {
+    ...texture,
+    ranks,
+    high,
+    low,
+    broadways,
+    dry,
+    dryAHigh,
+    dryKHigh,
+    paired,
+    monotone,
+    twoTone,
+    twoToneBroadway,
+    lowConnected,
+    middleConnected,
+    highConnected,
+    dynamicWetBoard,
+    primary,
+  };
+}
+
+function classifyStrategyHand(combo, board) {
+  const e = evalHand(combo, board);
+  const boardInfo = classifyBoardTexture(board);
+  const ranks = combo.map(card => RANK_VAL[card.rank]);
+  const overcards = ranks.filter(rank => rank > boardInfo.high).length;
+  const threatSuit = boardThreatSuit(board);
+  const nutFlushBlocker = threatSuit && combo.some(card => card.rank === 'A' && card.suit === threatSuit);
+  const hasAceBlocker = combo.some(card => card.rank === 'A');
+  const hasKingBlocker = combo.some(card => card.rank === 'K');
+  const blockerScore = (hasAceBlocker ? 2 : 0) + (hasKingBlocker ? 1 : 0) + (nutFlushBlocker ? 3 : 0);
+  const strongDraw = (e.flushDraw && (e.oesd || e.gutshot || overcards > 0)) || (e.oesd && overcards > 0);
+  const mediumDraw = e.flushDraw || e.oesd || e.gutshot || e.backdoorFD;
+  const nutted = e.made === 'full-house' || e.made === 'flush' || e.made === 'straight' || e.made === 'set';
+  const strongValue = nutted || e.made === 'overpair' || e.made === 'two-pair' ||
+    (e.made === 'top-pair' && e.strength >= 64);
+  const mediumShowdown = !strongValue && (
+    e.made === 'top-pair' ||
+    e.made === 'middle-pair' ||
+    e.made === 'pp-middle' ||
+    e.made === 'bottom-pair' ||
+    e.made === 'pp-under'
+  );
+  const weakShowdown = e.made === 'paired-board' || e.made === 'high-card';
+
+  let handClass = 'air';
+  if (nutted) handClass = 'nutted value';
+  else if (strongValue) handClass = 'strong value';
+  else if (strongDraw) handClass = 'strong draw';
+  else if (mediumShowdown) handClass = 'showdown value';
+  else if (mediumDraw) handClass = 'draw';
+  else if (weakShowdown && overcards > 0) handClass = 'overcards';
+
+  return {
+    eval: e,
+    handClass,
+    nutted,
+    strongValue,
+    mediumShowdown,
+    weakShowdown,
+    strongDraw,
+    mediumDraw,
+    overcards,
+    hasAceBlocker,
+    hasKingBlocker,
+    nutFlushBlocker,
+    blockerScore,
+  };
+}
+
+function estimatePreflopRangeShape(ctx) {
+  if (!ctx?.preflopAction || !ctx.heroPos) return { range: 0, nut: 0 };
+  const heroRange = resolveHeroPreflopRange(ctx.preflopAction, ctx.heroPos);
+  const villainRange = resolveVillainPreflopRange(ctx.preflopAction, ctx.heroPos);
+  const heroCombos = rangeComboCount(heroRange);
+  const villainCombos = rangeComboCount(villainRange);
+  if (!heroCombos || !villainCombos) return { range: 0, nut: 0 };
+
+  const density = Math.log((villainCombos + 1) / (heroCombos + 1));
+  const heroPremiums = ['AA', 'KK', 'QQ', 'AKs', 'AKo'].filter(hand => heroRange.has(hand)).length;
+  const villainPremiums = ['AA', 'KK', 'QQ', 'AKs', 'AKo'].filter(hand => villainRange.has(hand)).length;
+
+  return {
+    range: clamp(density * 9, -10, 10),
+    nut: clamp((heroPremiums - villainPremiums) * 2.2, -6, 6),
+  };
+}
+
+function estimateStrategicAdvantages(ctx, boardInfo) {
+  const heroPfa = ctx.preflopAction?.aggressor === ctx.heroPos;
+  const potType = ctx.preflopAction?.potType || 'SRP';
+  const rangeShape = estimatePreflopRangeShape(ctx);
+  let rangeAdvantage = heroPfa ? 14 : -14;
+  let nutAdvantage = heroPfa ? 8 : -4;
+
+  if (potType === '3BP') {
+    rangeAdvantage += heroPfa ? 14 : -10;
+    nutAdvantage += heroPfa ? 8 : -5;
+  } else if (potType === '4BP') {
+    rangeAdvantage += heroPfa ? 22 : -14;
+    nutAdvantage += heroPfa ? 14 : -8;
+  }
+
+  if (boardInfo.dryAHigh || boardInfo.dryKHigh) {
+    rangeAdvantage += heroPfa ? 16 : -12;
+    nutAdvantage += heroPfa ? 5 : -2;
+  }
+  if (boardInfo.lowConnected || boardInfo.middleConnected) {
+    rangeAdvantage += heroPfa ? -18 : 12;
+    nutAdvantage += heroPfa ? -14 : 12;
+  }
+  if (boardInfo.highConnected || boardInfo.twoToneBroadway) {
+    rangeAdvantage += heroPfa ? -10 : 8;
+    nutAdvantage += heroPfa ? -10 : 8;
+  }
+  if (boardInfo.monotone) {
+    rangeAdvantage -= 5;
+    nutAdvantage -= 3;
+  }
+  if (boardInfo.paired) {
+    rangeAdvantage += heroPfa ? 7 : -2;
+    nutAdvantage += heroPfa ? 3 : 0;
+  }
+  if (ctx.heroIP) rangeAdvantage += 4;
+  rangeAdvantage += rangeShape.range;
+  nutAdvantage += rangeShape.nut;
+
+  return {
+    rangeAdvantage: clamp(rangeAdvantage, -40, 45),
+    nutAdvantage: clamp(nutAdvantage, -35, 40),
+  };
+}
+
+function buildStrategyProfile(ctx) {
+  const boardInfo = classifyBoardTexture(ctx.boardCards || []);
+  const hand = classifyStrategyHand(ctx.combo || [], ctx.boardCards || []);
+  const heroPfa = ctx.preflopAction?.aggressor === ctx.heroPos;
+  const potType = ctx.preflopAction?.potType || 'SRP';
+  const spr = ctx.potBB > 0 ? ctx.stackBB / ctx.potBB : 10;
+  const isBBVsButtonSRP = potType === 'SRP' && ctx.heroPos === 'BB' && ctx.villainPos === 'BTN';
+  const isDonkNode = ctx.currentDecision?.type === 'first-to-act' && !heroPfa;
+  const isPfrCbetNode = heroPfa && (ctx.currentDecision?.type === 'first-to-act' || ctx.currentDecision?.type === 'checked-to');
+  const isOopPfrMiddlingWet = isPfrCbetNode && !ctx.heroIP &&
+    (boardInfo.middleConnected || boardInfo.lowConnected || boardInfo.dynamicWetBoard);
+  const advantages = estimateStrategicAdvantages(ctx, boardInfo);
+  const closeApprox = ctx.street === 'flop' &&
+    ['SRP', '3BP', '4BP'].includes(potType) &&
+    ['first-to-act', 'checked-to', 'facing-bet', 'facing-raise', 'facing-3bet'].includes(ctx.currentDecision?.type);
+
+  return {
+    ctx,
+    boardInfo,
+    hand,
+    heroPfa,
+    potType,
+    spr,
+    isBBVsButtonSRP,
+    isDonkNode,
+    isPfrCbetNode,
+    isOopPfrMiddlingWet,
+    confidenceLabel: closeApprox ? 'Close approximation' : 'Heuristic only',
+    ...advantages,
+  };
+}
+
+function percentMapToActions(entries) {
+  return normalizeActions(entries.map(entry => ({
+    name: entry.name,
+    pct: Math.round(entry.pct || 0),
+    detail: entry.detail,
+    color: entry.color,
+  })));
+}
+
+function distributeByWeights(totalPct, weights) {
+  const totalWeight = Object.values(weights).reduce((sum, value) => sum + Math.max(0, value), 0);
+  if (totalWeight <= 0 || totalPct <= 0) {
+    return Object.fromEntries(Object.keys(weights).map(key => [key, 0]));
+  }
+  const raw = Object.entries(weights).map(([key, value]) => [key, totalPct * Math.max(0, value) / totalWeight]);
+  const rounded = Object.fromEntries(raw.map(([key, value]) => [key, Math.floor(value)]));
+  let remainder = Math.round(totalPct) - Object.values(rounded).reduce((sum, value) => sum + value, 0);
+  raw
+    .map(([key, value]) => [key, value - Math.floor(value)])
+    .sort((a, b) => b[1] - a[1])
+    .forEach(([key]) => {
+      if (remainder > 0) {
+        rounded[key] += 1;
+        remainder -= 1;
+      }
+    });
+  return rounded;
+}
+
+function bettingSizeWeights(profile) {
+  const { boardInfo, hand, potType, rangeAdvantage, nutAdvantage } = profile;
+  let weights = { 25: 35, 50: 35, 75: 20, 100: 10 };
+
+  // Solver pattern: dry A/K-high boards with PFR range advantage use frequent
+  // small bets; pot-size betting is a rare polar branch, not the default.
+  if (boardInfo.dryAHigh || boardInfo.dryKHigh || boardInfo.paired) {
+    weights = { 25: 62, 50: 28, 75: 8, 100: 2 };
+  } else if (boardInfo.monotone) {
+    weights = { 25: 36, 50: 43, 75: 18, 100: 3 };
+  } else if (boardInfo.middleConnected || boardInfo.lowConnected || boardInfo.highConnected || boardInfo.twoToneBroadway) {
+    weights = { 25: 18, 50: 38, 75: 34, 100: 10 };
+  }
+
+  if (potType === '3BP' || potType === '4BP') {
+    weights[25] += 8;
+    weights[50] += 10;
+    weights[100] = Math.max(1, weights[100] - 5);
+  }
+  if (hand.nutted && nutAdvantage > 8 && !boardInfo.dryAHigh && !boardInfo.dryKHigh) {
+    weights[75] += 10;
+    weights[100] += 4;
+  }
+  if (hand.strongDraw && !profile.ctx.heroIP) {
+    weights[25] += 10;
+    weights[100] = Math.max(1, weights[100] - 5);
+  }
+  if (rangeAdvantage > 20 && (boardInfo.dryAHigh || boardInfo.dryKHigh)) {
+    weights[25] += 15;
+    weights[75] = Math.max(1, weights[75] - 5);
+    weights[100] = 1;
+  }
+  return weights;
+}
+
+function clampBettingFrequency(profile, betFreq) {
+  const flags = [];
+  let out = betFreq;
+  const specialDonkBoard = profile.boardInfo.paired || profile.boardInfo.lowConnected || profile.boardInfo.middleConnected;
+
+  if (profile.isBBVsButtonSRP && profile.isDonkNode) {
+    const maxDonk = specialDonkBoard ? 20 : 12;
+    if (out > maxDonk) flags.push(`BB donk capped at ${maxDonk}% in SRP`);
+    out = Math.min(out, maxDonk);
+  }
+  if (profile.isOopPfrMiddlingWet) {
+    if (out > 42) flags.push('OOP PFR reduced on connected middling/wet board');
+    out = Math.min(out, 42);
+  }
+  if (profile.boardInfo.dynamicWetBoard && profile.hand.mediumShowdown && out > 38) {
+    flags.push('medium showdown checks more on dynamic boards');
+    out = Math.min(out, 38);
+  }
+  return { betFreq: clamp(Math.round(out), 0, 96), flags };
+}
+
+function estimateBettingFrequency(profile) {
+  const { boardInfo, hand, heroPfa, potType, spr, rangeAdvantage, nutAdvantage } = profile;
+  let betFreq = heroPfa ? 52 : 24;
+
+  if (profile.isDonkNode) {
+    betFreq = profile.isBBVsButtonSRP ? 8 : 14;
+    if (boardInfo.lowConnected || boardInfo.middleConnected || boardInfo.paired) betFreq += 5;
+  } else if (heroPfa && profile.ctx.heroIP) {
+    if (boardInfo.dryAHigh) betFreq = 82;
+    else if (boardInfo.dryKHigh) betFreq = 74;
+    else if (boardInfo.paired) betFreq = 62;
+    else if (boardInfo.middleConnected || boardInfo.lowConnected || boardInfo.dynamicWetBoard) betFreq = 35;
+  } else if (heroPfa && !profile.ctx.heroIP) {
+    if (boardInfo.dryAHigh || boardInfo.dryKHigh) betFreq = 58;
+    else if (boardInfo.paired) betFreq = 48;
+    else if (boardInfo.middleConnected || boardInfo.lowConnected || boardInfo.dynamicWetBoard) betFreq = 30;
+  }
+
+  if ((potType === '3BP' || potType === '4BP') && heroPfa) {
+    if (boardInfo.dryAHigh || boardInfo.dryKHigh) betFreq = profile.ctx.heroIP ? 82 : 74;
+    else if (boardInfo.paired) betFreq = 66;
+    else if (boardInfo.dynamicWetBoard) betFreq = 46;
+    else betFreq = 62;
+  }
+
+  betFreq += rangeAdvantage * 0.35 + nutAdvantage * 0.20;
+
+  if (hand.nutted) betFreq += profile.isDonkNode ? 5 : 14;
+  else if (hand.strongValue) betFreq += profile.isDonkNode ? 2 : 9;
+  else if (hand.strongDraw) betFreq += profile.ctx.heroIP ? 8 : -5;
+  else if (hand.mediumShowdown) betFreq -= boardInfo.dynamicWetBoard ? 12 : 7;
+  else if (hand.handClass === 'overcards') betFreq += (profile.ctx.heroIP && heroPfa && !boardInfo.dynamicWetBoard) ? 5 : -5;
+  else betFreq -= 6;
+
+  if (hand.nutFlushBlocker && boardInfo.twoTone) betFreq += profile.ctx.heroIP ? 4 : 1;
+  if (spr <= 3.2 && (hand.strongValue || hand.strongDraw)) betFreq += 8;
+  if (spr >= 9 && !profile.ctx.heroIP && !hand.nutted) betFreq -= 4;
+
+  return clampBettingFrequency(profile, betFreq);
+}
+
+function buildBettingStrategy(ctx) {
+  const profile = buildStrategyProfile(ctx);
+  const { betFreq, flags } = estimateBettingFrequency(profile);
+  const checkName = ctx.currentDecision.type === 'checked-to' ? 'Check Back' : 'Check';
+  const sizePcts = distributeByWeights(betFreq, bettingSizeWeights(profile));
+  const boardLabel = profile.boardInfo.primary;
+  const handLabel = profile.hand.handClass;
+  const note = `${boardLabel}, ${handLabel}, range adv ${Math.round(profile.rangeAdvantage)}, nut adv ${Math.round(profile.nutAdvantage)}`;
+
+  return {
+    profile,
+    actions: percentMapToActions([
+      { name: 'Bet 25%', pct: sizePcts[25], detail: `${formatBB(ctx.potBB * 0.25)} BB - small range/protection size`, color: ACTION_COLORS.bet },
+      { name: 'Bet 50%', pct: sizePcts[50], detail: `${formatBB(ctx.potBB * 0.50)} BB - medium pressure size`, color: ACTION_COLORS.bet },
+      { name: 'Bet 75%', pct: sizePcts[75], detail: `${formatBB(ctx.potBB * 0.75)} BB - polar/value-heavy size`, color: ACTION_COLORS.bet },
+      { name: 'Bet 100%', pct: sizePcts[100], detail: `${formatBB(ctx.potBB)} BB - rare polar size, clamped away from default`, color: ACTION_COLORS.bet },
+      { name: checkName, pct: 100 - betFreq, detail: flags.length ? `${note} - ${flags.join('; ')}` : note, color: ACTION_COLORS.check },
+    ]),
+  };
+}
+
+function responseStrategyVersusBet(ctx) {
+  const profile = buildStrategyProfile(ctx);
+  const g = getFacingBetGeometry(ctx);
+  const size = ctx.currentDecision.betSize || 50;
+  const { hand, boardInfo } = profile;
+  let raise = 8;
+  let call = 42;
+  let fold = 50;
+
+  // Solver pattern: OOP strong draws often live in check-call/check-raise,
+  // not donk-lead. IP raises less often because position realizes equity.
+  if (hand.nutted) {
+    raise = profile.ctx.heroIP ? 34 : 48;
+    call = 100 - raise;
+    fold = 0;
+  } else if (hand.strongValue) {
+    raise = profile.ctx.heroIP ? 16 : 24;
+    call = 72;
+    fold = 12;
+  } else if (hand.strongDraw) {
+    raise = profile.ctx.heroIP ? 18 : 46;
+    call = profile.ctx.heroIP ? 72 : 50;
+    fold = 100 - raise - call;
+  } else if (hand.mediumShowdown) {
+    raise = 5;
+    call = boardInfo.dynamicWetBoard ? 55 : 68;
+    fold = 100 - raise - call;
+  } else if (hand.mediumDraw || hand.nutFlushBlocker || hand.overcards >= 2) {
+    raise = profile.ctx.heroIP ? 8 : 14;
+    call = hand.mediumDraw ? 50 : 34;
+    fold = 100 - raise - call;
+  }
+
+  if (size >= 75) {
+    raise -= hand.nutted || hand.strongDraw ? 4 : 3;
+    call -= hand.mediumShowdown || hand.handClass === 'overcards' ? 8 : 4;
+    fold = 100 - raise - call;
+  }
+  if (boardInfo.monotone && !hand.nutFlushBlocker && !hand.nutted) {
+    raise = Math.max(0, raise - 6);
+    fold = Math.min(100, fold + 6);
+  }
+
+  raise = clamp(Math.round(raise), 0, 82);
+  call = clamp(Math.round(call), 0, 100 - raise);
+  fold = 100 - raise - call;
+
+  return {
+    profile,
+    actions: percentMapToActions([
+      { name: 'Raise 3x', pct: raise, color: ACTION_COLORS.raise, detail: `to ${formatBB(g.raiseTo)} BB - check-raise/value/semi-bluff branch` },
+      { name: 'Call', pct: call, color: ACTION_COLORS.call, detail: `${formatBB(g.callAmount)} BB - continue based on class, blockers, and node` },
+      { name: 'Fold', pct: fold, color: ACTION_COLORS.fold, detail: 'range bottom / poor blockers' },
+    ]),
+  };
+}
+
+function responseStrategyVersusRaise(ctx) {
+  const profile = buildStrategyProfile(ctx);
+  const g = getFacingRaiseGeometry(ctx);
+  const { hand } = profile;
+  let threeBet = hand.nutted ? 32 : hand.strongValue ? 12 : hand.strongDraw ? 18 : hand.nutFlushBlocker ? 7 : 2;
+  let call = hand.nutted ? 62 : hand.strongValue ? 70 : hand.strongDraw ? 58 : hand.mediumShowdown ? 42 : hand.mediumDraw ? 34 : 16;
+  if (profile.boardInfo.monotone && !hand.nutFlushBlocker && !hand.nutted) call -= 8;
+  threeBet = clamp(Math.round(threeBet), 0, 70);
+  call = clamp(Math.round(call), 0, 100 - threeBet);
+  const fold = 100 - threeBet - call;
+
+  return {
+    profile,
+    actions: percentMapToActions([
+      { name: '3-bet 3x', pct: threeBet, color: ACTION_COLORS.raise, detail: `to ${formatBB(g.hero3BetTo)} BB - polarized continue branch` },
+      { name: 'Call', pct: call, color: ACTION_COLORS.call, detail: `${formatBB(g.callAmount)} BB - continue with value/draws` },
+      { name: 'Fold', pct: fold, color: ACTION_COLORS.fold, detail: 'range bottom / dominated continues removed' },
+    ]),
+  };
+}
+
+function responseStrategyVersus3Bet(ctx) {
+  const profile = buildStrategyProfile(ctx);
+  const g = getFacing3BetGeometry(ctx);
+  const { hand } = profile;
+  let fourBet = hand.nutted ? 38 : hand.strongValue ? 16 : hand.strongDraw && hand.nutFlushBlocker ? 14 : 3;
+  let call = hand.nutted ? 54 : hand.strongValue ? 60 : hand.strongDraw ? 50 : hand.mediumDraw ? 28 : 12;
+  fourBet = clamp(Math.round(fourBet), 0, 75);
+  call = clamp(Math.round(call), 0, 100 - fourBet);
+  const fold = 100 - fourBet - call;
+
+  return {
+    profile,
+    actions: percentMapToActions([
+      { name: '4-bet (jam)', pct: fourBet, color: ACTION_COLORS.raise, detail: `jam ${formatBB(g.heroJamDelta)} BB more - polar/value branch` },
+      { name: 'Call', pct: call, color: ACTION_COLORS.call, detail: `${formatBB(g.callAmount)} BB - condensed continue branch` },
+      { name: 'Fold', pct: fold, color: ACTION_COLORS.fold, detail: 'range bottom versus re-raise' },
+    ]),
+  };
+}
+
+function estimatePostflopStrategy(ctx) {
+  if (ctx.currentDecision.type === 'facing-3bet') return responseStrategyVersus3Bet(ctx);
+  if (ctx.currentDecision.type === 'facing-raise') return responseStrategyVersusRaise(ctx);
+  if (ctx.currentDecision.type === 'facing-bet') return responseStrategyVersusBet(ctx);
+  return buildBettingStrategy(ctx);
+}
+
+function getFallbackBettingActions(ctx) {
+  return buildBettingStrategy(ctx).actions;
+}
+
+function getFallbackFacingBetActions(ctx) {
+  return responseStrategyVersusBet(ctx).actions;
+}
+
+function getFallbackFacingRaiseActions(ctx) {
+  return responseStrategyVersusRaise(ctx).actions;
+}
+
+function getFallbackFacing3BetActions(ctx) {
+  return responseStrategyVersus3Bet(ctx).actions;
+}
+
+function getFallbackRecommendation(ctx) {
+  const strategy = estimatePostflopStrategy(ctx);
+  const profile = strategy.profile;
+  const boardLabel = profile?.boardInfo?.primary || 'unclassified board';
+  const handLabel = profile?.hand?.handClass || 'unknown hand class';
+  return {
+    type: ctx.currentDecision.type,
+    source: 'fallback',
+    sourceLabel: `Solver-like estimate - ${boardLabel} - ${handLabel}`,
+    confidenceLabel: profile.confidenceLabel,
+    boardClassLabel: boardLabel,
+    handClassLabel: handLabel,
+    rangeAdvantage: profile.rangeAdvantage,
+    nutAdvantage: profile.nutAdvantage,
+    nodeKey: ctx.nodeKey || buildGtoNodeKey(ctx),
+    abstractKey: ctx.abstractKey || buildAbstractSpotKey(ctx),
+    actions: strategy.actions,
+  };
+}
+
+/*
+function getFallbackBettingActions(ctx) {
+  const checkName = ctx.currentDecision.type === 'checked-to' ? 'Check Back' : 'Check';
+  const actions = [
+    { name: 'Bet 25%',  pct: Math.round((mix['Bet 25%']  || 0) * 100), detail: `${formatBB(ctx.potBB * 0.25)} BB - EV ${formatBB(evs['Bet 25%'])} BB`, color: ACTION_COLORS.bet },
+    { name: 'Bet 50%',  pct: Math.round((mix['Bet 50%']  || 0) * 100), detail: `${formatBB(ctx.potBB * 0.50)} BB - EV ${formatBB(evs['Bet 50%'])} BB`, color: ACTION_COLORS.bet },
+    { name: 'Bet 75%',  pct: Math.round((mix['Bet 75%']  || 0) * 100), detail: `${formatBB(ctx.potBB * 0.75)} BB - EV ${formatBB(evs['Bet 75%'])} BB`, color: ACTION_COLORS.bet },
+    { name: 'Bet 100%', pct: Math.round((mix['Bet 100%'] || 0) * 100), detail: `${formatBB(ctx.potBB)} BB - EV ${formatBB(evs['Bet 100%'])} BB`,       color: ACTION_COLORS.bet },
+    { name: checkName,  pct: Math.round((mix['Check']    || 0) * 100), detail: `EV ${formatBB(evs['Check'])} BB - realize equity`,                      color: ACTION_COLORS.check },
+  ];
+  return normalizeActions(actions);
+}
+
+function getFallbackFacingBetActions(ctx) {
+  const eqCtx = ctx.equityContext || computeEquityContext(ctx);
+  const equity = eqCtx.equity ?? 0.5;
+  const evs = computeActionEVs(ctx, equity, eqCtx.villainCombos);
+  const mix = softmaxMixActions(evs, 0.7);
+
+  const g = getFacingBetGeometry(ctx);
+  const minEquity = g.callAmount / g.finalPotIfCall;
+
+  return normalizeActions([
+    { name: 'Raise 3x', pct: Math.round((mix['Raise'] || 0) * 100), color: ACTION_COLORS.raise, detail: `to ${formatBB(g.raiseTo)} BB - EV ${formatBB(evs['Raise'])} BB` },
+    { name: 'Call',     pct: Math.round((mix['Call']  || 0) * 100), color: ACTION_COLORS.call,  detail: `${formatBB(g.callAmount)} BB - need ${(minEquity * 100).toFixed(0)}% - EV ${formatBB(evs['Call'])} BB` },
+    { name: 'Fold',     pct: Math.round((mix['Fold']  || 0) * 100), color: ACTION_COLORS.fold,  detail: 'EV 0 BB' },
+  ]);
+}
+
+function getFallbackFacingRaiseActions(ctx) {
+  const eqCtx = ctx.equityContext || computeEquityContext(ctx);
+  const equity = eqCtx.equity ?? 0.5;
+  const evs = computeActionEVs(ctx, equity, eqCtx.villainCombos);
+  const mix = softmaxMixActions(evs, 0.7);
+  const g = getFacingRaiseGeometry(ctx);
+  const minEquity = g.callAmount / Math.max(0.1, g.finalPotIfCall);
+
+  return normalizeActions([
+    { name: '3-bet 3x', pct: Math.round((mix['3-bet'] || 0) * 100), color: ACTION_COLORS.raise,
+      detail: `to ${formatBB(g.hero3BetTo)} BB - EV ${formatBB(evs['3-bet'])} BB` },
+    { name: 'Call', pct: Math.round((mix['Call'] || 0) * 100), color: ACTION_COLORS.call,
+      detail: `${formatBB(g.callAmount)} BB - need ${(minEquity * 100).toFixed(0)}% - EV ${formatBB(evs['Call'])} BB` },
+    { name: 'Fold', pct: Math.round((mix['Fold'] || 0) * 100), color: ACTION_COLORS.fold,
+      detail: 'EV 0 BB' },
+  ]);
+}
+
+function getFallbackFacing3BetActions(ctx) {
+  const eqCtx = ctx.equityContext || computeEquityContext(ctx);
+  const equity = eqCtx.equity ?? 0.5;
+  const evs = computeActionEVs(ctx, equity, eqCtx.villainCombos);
+  const mix = softmaxMixActions(evs, 0.7);
+  const g = getFacing3BetGeometry(ctx);
+  const minEquity = g.callAmount / Math.max(0.1, g.finalPotIfCall);
+
+  return normalizeActions([
+    { name: '4-bet (jam)', pct: Math.round((mix['4-bet (jam)'] || 0) * 100), color: ACTION_COLORS.raise,
+      detail: `jam ${formatBB(g.heroJamDelta)} BB more - EV ${formatBB(evs['4-bet (jam)'])} BB` },
+    { name: 'Call',        pct: Math.round((mix['Call'] || 0) * 100),        color: ACTION_COLORS.call,
+      detail: `${formatBB(g.callAmount)} BB - need ${(minEquity * 100).toFixed(0)}% - EV ${formatBB(evs['Call'])} BB` },
+    { name: 'Fold',        pct: Math.round((mix['Fold'] || 0) * 100),        color: ACTION_COLORS.fold,
+      detail: 'EV 0 BB' },
+  ]);
+}
+
+function getFallbackRecommendation(ctx) {
+  let actions;
+  if (ctx.currentDecision.type === 'facing-3bet') actions = getFallbackFacing3BetActions(ctx);
+  else if (ctx.currentDecision.type === 'facing-raise') actions = getFallbackFacingRaiseActions(ctx);
+  else if (ctx.currentDecision.type === 'facing-bet') actions = getFallbackFacingBetActions(ctx);
+  else actions = getFallbackBettingActions(ctx);
+
+  return {
+    type: ctx.currentDecision.type,
+    source: 'fallback',
+    sourceLabel: 'Estimated fallback - no exact GTO node loaded',
+    nodeKey: ctx.nodeKey || buildGtoNodeKey(ctx),
+    abstractKey: ctx.abstractKey || buildAbstractSpotKey(ctx),
+    actions,
+  };
+}
+*/
+
+
+// ============================================================
+// LEGACY EV / RESPONSE UTILITIES
+// ============================================================
+// Kept for experimentation and exact-equity diagnostics. The production
+// fallback above no longer maps equity/EV directly into betting frequency.
+
+function estimateVillainResponsesLegacy(villainCombos, board, betSizePct, isFacingHeroRaise) {
+  // For each combo, classify how it plays vs a bet of size betSizePct
+  // Returns { foldRate, callRate, raiseRate }
+  if (villainCombos.length === 0) return { foldRate: 0.5, callRate: 0.45, raiseRate: 0.05 };
+  // Required equity to call (in fraction): bet / (pot + 2*bet)
+  const reqEqFrac = betSizePct / (100 + 2 * betSizePct);
+
+  let folds = 0, calls = 0, raises = 0;
+  for (const combo of villainCombos) {
+    const e = evalHand(combo, board);
+    // Approximate combo equity vs a generic-strong continuing range
+    // Combos with strength >> required equity tend to raise (top tier)
+    // Mid combos call, weak combos fold
+    const approxEq = Math.max(0, Math.min(1, e.strength / 100));
+    const hasDraw = e.flushDraw || e.oesd;
+    const drawBoost = hasDraw ? 0.12 : 0;
+    const totalEq = approxEq + drawBoost;
+
+    if (isFacingHeroRaise && e.strength >= 92) raises++;
+    else if (isFacingHeroRaise && e.strength >= 86 && hasDraw) raises++;
+    else if (e.strength >= 85 && !isFacingHeroRaise) raises++;
+    else if (e.strength >= 75 && betSizePct >= 75 && !isFacingHeroRaise) raises++;
+    else if (totalEq >= reqEqFrac * 1.15) calls++;
+    else if (totalEq < reqEqFrac * 0.85) folds++;
+    else {
+      // Marginal — mix 50/50 (roughly)
+      if ((folds + calls + raises) % 2 === 0) calls++; else folds++;
+    }
+  }
+  const total = villainCombos.length;
+  return {
+    foldRate: folds / total,
+    callRate: calls / total,
+    raiseRate: raises / total,
+  };
+}
+
+function responseScore(combo, board, texture, heroCombo = null) {
+  const e = evalHand(combo, board);
+  const hasDraw = e.flushDraw || e.oesd || e.gutshot;
+  const drawScore = (e.flushDraw ? 10 : 0) + (e.oesd ? 9 : 0) + (e.gutshot ? 3 : 0) + (e.backdoorFD ? 1 : 0);
+  const blockerScore = combo.some(card => card.rank === 'A') ? 2.2 : 0;
+  const wetBoost = texture.wetness >= 3 && hasDraw ? 4 : 0;
+  const pairedPenalty = texture.paired && e.made === 'top-pair' ? -2 : 0;
+  const equityVsHero = heroCombo
+    ? comboVsComboEquity(combo, heroCombo, board)
+    : clamp(e.strength / 100, 0, 1);
+  const drawEquityBonus = (e.flushDraw ? 0.075 : 0) + (e.oesd ? 0.065 : 0) + (e.gutshot ? 0.025 : 0) + (e.backdoorFD ? 0.01 : 0);
+  return {
+    combo,
+    eval: e,
+    hasDraw,
+    equityVsHero,
+    drawEquityBonus,
+    continueScore: equityVsHero * 100 + drawScore * 0.7 + blockerScore + wetBoost * 0.5,
+    raiseScore: equityVsHero * 100 + e.strength * 0.35 + drawScore + blockerScore + wetBoost + pairedPenalty,
+    score: equityVsHero * 100 + drawScore + blockerScore + wetBoost + pairedPenalty,
+  };
+}
+
+function estimateVillainResponses(villainCombos, board, betSizePct, isFacingHeroRaise, heroCombo = null) {
+  if (villainCombos.length === 0) {
+    return { foldRate: 0.5, callRate: 0.45, raiseRate: 0.05, foldCombos: [], callCombos: [], raiseCombos: [] };
+  }
+
+  const cacheKey = responseCacheKey(heroCombo, villainCombos, board, betSizePct, isFacingHeroRaise);
+  if (RESPONSE_CACHE.has(cacheKey)) return RESPONSE_CACHE.get(cacheKey);
+
+  const texture = getBoardTexture(board);
+  const scoreKey = responseScoreCacheKey(heroCombo, villainCombos, board);
+  const scored = RESPONSE_SCORE_CACHE.get(scoreKey) ||
+    rememberResponseScores(scoreKey, villainCombos.map(combo => responseScore(combo, board, texture, heroCombo)));
+
+  const n = scored.length;
+  const mdf = 100 / (100 + betSizePct);
+  const priceEquity = betSizePct / (100 + 2 * betSizePct);
+  const textureBoost = clamp(texture.wetness, 0, 5) * 0.02;
+  const pairedAdjustment = texture.paired ? -0.035 : 0;
+  const continueTarget = isFacingHeroRaise
+    ? clamp(mdf * 0.58 + textureBoost + pairedAdjustment, 0.20, 0.62)
+    : clamp(mdf + textureBoost + pairedAdjustment, 0.45, 0.88);
+
+  const pricedContinueCount = scored.filter(item =>
+    item.equityVsHero + item.drawEquityBonus >= priceEquity * (isFacingHeroRaise ? 1.12 : 0.96)
+  ).length;
+  const mdfContinueCount = Math.round(n * continueTarget);
+  const continueCount = Math.max(1, Math.min(n, Math.max(pricedContinueCount, mdfContinueCount)));
+
+  const raiseTarget = isFacingHeroRaise
+    ? clamp(0.025 + texture.wetness * 0.007, 0.015, 0.075)
+    : clamp(0.045 + texture.wetness * 0.011 - (betSizePct >= 75 ? 0.010 : 0), 0.025, 0.105);
+
+  const raiseCount = Math.max(0, Math.min(continueCount - 1, Math.round(n * raiseTarget)));
+  const valueRaiseCount = Math.ceil(raiseCount * 0.72);
+  const bluffRaiseCount = raiseCount - valueRaiseCount;
+
+  const raiseSet = new Set();
+  const byRaise = [...scored].sort((a, b) => b.raiseScore - a.raiseScore);
+  byRaise.slice(0, valueRaiseCount).forEach(item => raiseSet.add(item.combo));
+
+  if (bluffRaiseCount > 0) {
+    const bluffCandidates = [...scored]
+      .filter(item => item.hasDraw || item.combo.some(card => card.rank === 'A'))
+      .sort((a, b) => (b.drawEquityBonus + b.continueScore / 200) - (a.drawEquityBonus + a.continueScore / 200));
+    bluffCandidates.slice(0, bluffRaiseCount).forEach(item => raiseSet.add(item.combo));
+  }
+
+  const callItems = [];
+  const byContinue = [...scored].sort((a, b) => b.continueScore - a.continueScore);
+  for (const item of byContinue) {
+    if (callItems.length + raiseSet.size >= continueCount) break;
+    if (!raiseSet.has(item.combo)) callItems.push(item);
+  }
+
+  const callCombos = callItems.map(item => item.combo);
+  const raiseCombos = scored.filter(item => raiseSet.has(item.combo)).map(item => item.combo);
+  const continueSet = new Set([...callCombos, ...raiseCombos]);
+  const foldCombos = scored.filter(item => !continueSet.has(item.combo)).map(item => item.combo);
+
+  return rememberResponse(cacheKey, {
+    foldRate: foldCombos.length / n,
+    callRate: callCombos.length / n,
+    raiseRate: raiseCombos.length / n,
+    foldCombos,
+    callCombos,
+    raiseCombos,
+  });
+}
+
+function equityVsSubset(heroCombo, villainCombos, board, predicate) {
+  // Lightweight estimator for hero's equity vs a filtered subset.
+  // Just measures hero's strength rank among the filtered set.
+  // (Avoids running another full MC — used for quick EV approximations.)
+  const filtered = villainCombos.filter(c => predicate(c));
+  if (filtered.length === 0) return 0.5;
+  const { equity } = monteCarloEquity(heroCombo, filtered, board, 400);
+  return equity;
+}
+
+function equityRealizationFactor(ctx) {
+  if (ctx.street === 'river') return 1;
+  let factor = ctx.heroIP ? 0.99 : 0.91;
+  if (ctx.street === 'flop') factor -= ctx.heroIP ? 0.02 : 0.04;
+  if (ctx.preflopAction?.aggressor === ctx.heroPos) factor += 0.025;
+  if (ctx.currentDecision?.type === 'facing-bet') factor -= ctx.heroIP ? 0.015 : 0.025;
+  if (ctx.currentDecision?.type === 'facing-raise' || ctx.currentDecision?.type === 'facing-3bet') factor -= 0.035;
+  return clamp(factor, 0.72, 1.03);
+}
+
+function applySolverShapePriors(ctx, evs) {
+  if (ctx.currentDecision.type !== 'first-to-act' && ctx.currentDecision.type !== 'checked-to') return evs;
+
+  const adjusted = { ...evs };
+  const texture = getBoardTexture(ctx.boardCards);
+  const heroPfa = ctx.preflopAction?.aggressor === ctx.heroPos;
+  const dryHigh = texture.wetness <= 1 && texture.highCard >= 12 && !texture.monotone;
+  const wetDynamic = texture.wetness >= 3 || texture.monotone;
+  const paired = texture.paired;
+  const lowSpr = ctx.stackBB / Math.max(1, ctx.potBB) <= 3.2;
+
+  if (heroPfa && dryHigh) {
+    adjusted['Bet 25%'] = (adjusted['Bet 25%'] ?? -1e6) + 0.95;
+    adjusted['Bet 50%'] = (adjusted['Bet 50%'] ?? -1e6) + 0.28;
+    adjusted['Bet 75%'] = (adjusted['Bet 75%'] ?? -1e6) - 0.42;
+    adjusted['Bet 100%'] = (adjusted['Bet 100%'] ?? -1e6) - 0.72;
+    adjusted.Check = (adjusted.Check ?? 0) + (ctx.heroIP ? 0.08 : 0.04);
+  }
+
+  if (wetDynamic) {
+    adjusted['Bet 25%'] = (adjusted['Bet 25%'] ?? -1e6) - 0.14;
+    adjusted['Bet 75%'] = (adjusted['Bet 75%'] ?? -1e6) + 0.18;
+    adjusted['Bet 100%'] = (adjusted['Bet 100%'] ?? -1e6) + 0.12;
+  }
+
+  if (paired) {
+    adjusted['Bet 25%'] = (adjusted['Bet 25%'] ?? -1e6) + 0.22;
+    adjusted['Bet 100%'] = (adjusted['Bet 100%'] ?? -1e6) - 0.18;
+  }
+
+  if (!heroPfa) {
+    adjusted.Check = (adjusted.Check ?? 0) + (ctx.heroIP ? 0.18 : 0.28);
+    adjusted['Bet 25%'] = (adjusted['Bet 25%'] ?? -1e6) - 0.08;
+    adjusted['Bet 50%'] = (adjusted['Bet 50%'] ?? -1e6) - 0.08;
+    adjusted['Bet 75%'] = (adjusted['Bet 75%'] ?? -1e6) - 0.12;
+    adjusted['Bet 100%'] = (adjusted['Bet 100%'] ?? -1e6) - 0.16;
+  }
+
+  if ((ctx.preflopAction?.potType === '3BP' || ctx.preflopAction?.potType === '4BP') && !lowSpr) {
+    adjusted['Bet 25%'] = (adjusted['Bet 25%'] ?? -1e6) + 0.16;
+    adjusted['Bet 50%'] = (adjusted['Bet 50%'] ?? -1e6) + 0.10;
+    adjusted['Bet 100%'] = (adjusted['Bet 100%'] ?? -1e6) - 0.20;
+  }
+
+  return adjusted;
+}
+
+function computeActionEVs(ctx, equity, villainCombos) {
+  const pot = ctx.potBB;
+  const eff = ctx.stackBB;
+  const board = ctx.boardCards;
+  const realFactor = equityRealizationFactor(ctx);
+
+  // ---- FACING 3-BET ----
+  // Hero raised on this street, villain re-raised. Hero now: call / 4-bet (jam) / fold.
+  if (ctx.currentDecision.type === 'facing-3bet') {
+    const g = getFacing3BetGeometry(ctx);
+    const evs = {};
+    evs['Fold'] = 0;
+    evs['Call'] = equity * g.finalPotIfCall * realFactor - g.callAmount;
+
+    // 4-bet at this SPR is functionally a jam in most spots. Model as all-in.
+    if (g.heroJamDelta <= g.callAmount || g.heroJamDelta <= 0) {
+      evs['4-bet (jam)'] = -1e6;
+    } else {
+      const jamSizePct = (ctx.stackBB / Math.max(0.1, pot)) * 100;
+      const resp = estimateVillainResponses(villainCombos, board, jamSizePct, true, ctx.combo);
+      const continueCombos = [...resp.callCombos, ...resp.raiseCombos];
+      const villainFoldRate = clamp(resp.foldRate, 0.05, 0.72);
+      const eqVs4betCall = continueCombos.length
+        ? calculateEquity(ctx.combo, continueCombos, board).equity
+        : equity * 0.58;
+      evs['4-bet (jam)'] = villainFoldRate * g.potAtDecision +
+                            (1 - villainFoldRate) * (eqVs4betCall * g.finalPotIfJamCalled * realFactor - g.heroJamDelta);
+    }
+    return evs;
+  }
+
+  if (ctx.currentDecision.type === 'facing-raise') {
+    const g = getFacingRaiseGeometry(ctx);
+    const evs = {};
+    evs['Fold'] = 0;
+    evs['Call'] = equity * g.finalPotIfCall * realFactor - g.callAmount;
+
+    if (g.hero3BetTo <= g.villainRaiseTo || g.hero3BetAdd <= g.callAmount) {
+      evs['3-bet'] = -1e6;
+    } else {
+      const resp = estimateVillainResponses(villainCombos, board, (g.hero3BetTo / Math.max(0.1, pot)) * 100, true, ctx.combo);
+      const eqVsCallRange = resp.callCombos.length
+        ? calculateEquity(ctx.combo, resp.callCombos, board).equity
+        : equity * 0.68;
+      evs['3-bet'] =
+        resp.foldRate * g.potAtDecision +
+        resp.callRate * (eqVsCallRange * g.finalPotIf3BetCalled * realFactor - g.hero3BetAdd) +
+        resp.raiseRate * (-g.hero3BetAdd);
+    }
+    return evs;
+  }
+
+  if (ctx.currentDecision.type === 'facing-bet') {
+    const g = getFacingBetGeometry(ctx);
+    const evs = {};
+
+    // FOLD: baseline 0 (don't put more in)
+    evs['Fold'] = 0;
+
+    // CALL: realize equity on callPot, minus call cost
+    evs['Call'] = equity * g.finalPotIfCall * realFactor - g.callAmount;
+
+    // RAISE: villain folds, calls, or 4-bets
+    // Approximate villain response to our raise: fold most marginal hands, call top range
+    // Fold rate: hands too weak to continue vs 3x raise (need ~37% equity)
+    if (g.raiseTo <= g.villainBet || g.heroRaiseAdd <= 0) {
+      evs['Raise'] = -1e6;
+    } else {
+      const resp = estimateVillainResponses(villainCombos, board, (g.raiseTo / Math.max(0.1, pot)) * 100, true, ctx.combo);
+      const eqVsCallRange = resp.callCombos.length
+        ? calculateEquity(ctx.combo, resp.callCombos, board).equity
+        : equity * 0.78;
+      const raiseEquity = resp.raiseCombos.length
+        ? calculateEquity(ctx.combo, resp.raiseCombos, board).equity
+        : equity * 0.55;
+      const raiseNodeEVs = computeActionEVs(
+        { ...ctx, currentDecision: { type: 'facing-3bet', initialBetSize: g.sizePct } },
+        raiseEquity,
+        resp.raiseCombos
+      );
+      const bestAfter3Bet = Math.max(raiseNodeEVs.Fold ?? 0, raiseNodeEVs.Call ?? -1e6, raiseNodeEVs['4-bet (jam)'] ?? -1e6);
+      evs['Raise'] =
+        resp.foldRate * (pot + g.villainBet) +
+        resp.callRate * (eqVsCallRange * g.finalPotIfRaiseCalled * realFactor - g.raiseTo) +
+        resp.raiseRate * (bestAfter3Bet - g.raiseTo);
+    }
+
+    return evs;
+  }
+
+  // First-to-act or checked-to: candidates are Check + bet sizes
+  const evs = {};
+  // CHECK: realize equity on current pot (no commitment)
+  evs['Check'] = equity * pot * realFactor;
+
+  for (const size of [25, 50, 75, 100]) {
+    const bet = pot * size / 100;
+    if (bet > eff) {
+      evs['Bet ' + size + '%'] = -1e6; // can't bet, mark as invalid
+      continue;
+    }
+    const resp = estimateVillainResponses(villainCombos, board, size, false, ctx.combo);
+    const callPot = pot + 2 * bet;
+    // When villain calls, range is stronger — discount our equity
+    const eqVsCallRange = resp.callCombos.length
+      ? calculateEquity(ctx.combo, resp.callCombos, board).equity
+      : equity * 0.80;
+    // When villain raises, we face a 3x raise; approximate EV as -bet
+    // (hero typically folds bad hands vs raise, calls premiums — net negative)
+    const raiseCombos = resp.raiseCombos;
+    const raiseEquity = raiseCombos.length
+      ? calculateEquity(ctx.combo, raiseCombos, board).equity
+      : equity * 0.55;
+    const raiseNodeEVs = computeActionEVs(
+      { ...ctx, currentDecision: { type: 'facing-raise', initialBetSize: size } },
+      raiseEquity,
+      raiseCombos
+    );
+    const bestAfterRaise = Math.max(raiseNodeEVs.Fold ?? 0, raiseNodeEVs.Call ?? -1e6, raiseNodeEVs['3-bet'] ?? -1e6);
+    const raiseEV = bestAfterRaise - bet;
+    evs['Bet ' + size + '%'] =
+      resp.foldRate * pot +
+      resp.callRate * (eqVsCallRange * callPot * realFactor - bet) +
+      resp.raiseRate * raiseEV;
+  }
+  return applySolverShapePriors(ctx, evs);
+}
+
+function softmaxMixActions(evs, beta = 0.7) {
+  // beta = inverse-temperature in 1/BB. Higher beta → more pure strategy.
+  // beta ≈ 0.7 means actions ~1.4 BB apart get ~e^1 = 2.7x frequency ratio.
+  const entries = Object.entries(evs).filter(([_, v]) => v > -1e5);
+  if (entries.length === 0) return {};
+  const maxEV = Math.max(...entries.map(([_, v]) => v));
+  const weights = entries.map(([name, v]) => [name, Math.exp(beta * (v - maxEV))]);
+  const total = weights.reduce((s, [_, w]) => s + w, 0);
+  const out = {};
+  weights.forEach(([name, w]) => { out[name] = w / total; });
+  return out;
+}
+
+function getRecommendation(ctx, inlineSolverData = null) {
+  const nodeKey = buildGtoNodeKey(ctx);
+  const abstractKey = buildAbstractSpotKey(ctx);
+  const inlineNode = resolveInlineSolverNode(inlineSolverData, nodeKey, abstractKey);
+  const libraryHit = inlineNode
+    ? { node: inlineNode, sourceLabel: 'Exact/common GTO - imported JSON' }
+    : lookupSolverNode(nodeKey, abstractKey);
+  const exact = libraryHit
+    ? normalizeSolverNode(libraryHit.node, nodeKey, libraryHit.sourceLabel, abstractKey)
+    : null;
+  if (exact) return exact;
+  const rangeCtx = computeRangeContext(ctx);
+  const rec = getFallbackRecommendation({ ...ctx, nodeKey, abstractKey, rangeContext: rangeCtx });
+  return {
+    ...rec,
+    nodeKey,
+    abstractKey,
+    vCount: rangeCtx.vCount,
+    rangeLabel: rangeCtx.rangeLabel,
+  };
+}
+
+// Regression tests for the local strategy engine. These are intentionally
+// behavior-level tests: they check solver-like shape rather than raw equity.
+const POSTFLOP_STRATEGY_TEST_CASES = [
+  {
+    name: 'UTG vs BTN, KQ on JT6 rainbow: mostly check OOP',
+    heroPos: 'UTG',
+    villainPos: 'BTN',
+    preflopId: 'utg-raise-btn-call',
+    combo: ['Kh', 'Qd'],
+    board: ['Jc', 'Td', '6s'],
+    decisionId: 'oop-hero-first-to-act',
+    expectations: [
+      { metric: 'Check', min: 60 },
+      { metric: 'Bet 100%', max: 8 },
+    ],
+  },
+  {
+    name: 'BTN vs BB, KQ on A72 rainbow: high small c-bet',
+    heroPos: 'BTN',
+    villainPos: 'BB',
+    preflopId: 'btn-raise-bb-call',
+    combo: ['Kh', 'Qd'],
+    board: ['As', '7d', '2c'],
+    decisionId: 'ip-villain-checks-to-hero',
+    expectations: [
+      { metric: 'Bet 25%', min: 45 },
+      { metric: 'Check Back', max: 30 },
+      { metric: 'Bet 100%', max: 5 },
+    ],
+  },
+  {
+    name: 'CO vs BB, AK no spade on 984 two-tone: mostly check back',
+    heroPos: 'CO',
+    villainPos: 'BB',
+    preflopId: 'co-raise-bb-call',
+    combo: ['Ah', 'Kd'],
+    board: ['9s', '8s', '4d'],
+    decisionId: 'ip-villain-checks-to-hero',
+    expectations: [
+      { metric: 'Check Back', min: 55 },
+      { metric: 'Bet 100%', max: 8 },
+    ],
+  },
+  {
+    name: 'SB 3bet vs BTN, AA on K72 rainbow: bet often, small/medium',
+    heroPos: 'SB',
+    villainPos: 'BTN',
+    preflopId: 'btn-raise-sb-3bet-btn-call',
+    combo: ['Ah', 'Ad'],
+    board: ['Ks', '7d', '2c'],
+    decisionId: 'oop-hero-first-to-act',
+    expectations: [
+      { metric: 'betTotal', min: 65 },
+      { metric: 'smallMediumTotal', min: 55 },
+      { metric: 'Bet 100%', max: 6 },
+    ],
+  },
+  {
+    name: 'BB vs BTN, T9ss on QJ5ss: check first',
+    heroPos: 'BB',
+    villainPos: 'BTN',
+    preflopId: 'btn-raise-bb-call',
+    combo: ['Ts', '9s'],
+    board: ['Qs', 'Jd', '5s'],
+    decisionId: 'oop-hero-first-to-act',
+    expectations: [
+      { metric: 'Check', min: 80 },
+      { metric: 'betTotal', max: 20 },
+    ],
+  },
+  {
+    name: 'BB vs BTN, T9ss on QJ5ss: check-raise often vs bet',
+    heroPos: 'BB',
+    villainPos: 'BTN',
+    preflopId: 'btn-raise-bb-call',
+    combo: ['Ts', '9s'],
+    board: ['Qs', 'Jd', '5s'],
+    decisionId: 'oop-hero-check-facing-villain-bet-50',
+    expectations: [
+      { metric: 'Raise 3x', min: 35 },
+      { metric: 'Fold', max: 10 },
+    ],
+  },
+];
+
+function parseTestCard(token) {
+  return { rank: token[0], suit: token[1] };
+}
+
+function strategyActionPct(actions, name) {
+  const action = actions.find(item => item.name === name);
+  return action ? action.pct : 0;
+}
+
+function strategyMetric(actions, metric) {
+  if (metric === 'betTotal') {
+    return actions
+      .filter(action => action.name.startsWith('Bet '))
+      .reduce((sum, action) => sum + action.pct, 0);
+  }
+  if (metric === 'smallMediumTotal') {
+    return strategyActionPct(actions, 'Bet 25%') + strategyActionPct(actions, 'Bet 50%');
+  }
+  return strategyActionPct(actions, metric);
+}
+
+function buildStrategyTestContext(testCase) {
+  const preflopAction = PREFLOP_LINES.find(line => line.id === testCase.preflopId);
+  const heroIP = isHeroIP(testCase.heroPos, testCase.villainPos);
+  const currentDecision = getDecisionOptions(heroIP).find(option => option.id === testCase.decisionId);
+  return {
+    street: 'flop',
+    heroPos: testCase.heroPos,
+    villainPos: testCase.villainPos,
+    combo: testCase.combo.map(parseTestCard),
+    boardCards: testCase.board.map(parseTestCard),
+    currentDecision,
+    preflopAction,
+    flopAction: null,
+    turnAction: null,
+    heroIP,
+    stackBB: estimateRemainingStackForNode(preflopAction, null, null, 'flop', 100),
+    potBB: preflopAction?.potBB || 6,
+  };
+}
+
+function runPostflopStrategyTests() {
+  return POSTFLOP_STRATEGY_TEST_CASES.map(testCase => {
+    const ctx = buildStrategyTestContext(testCase);
+    const strategy = estimatePostflopStrategy(ctx);
+    const checks = testCase.expectations.map(expectation => {
+      const value = strategyMetric(strategy.actions, expectation.metric);
+      const minPass = expectation.min == null || value >= expectation.min;
+      const maxPass = expectation.max == null || value <= expectation.max;
+      return { ...expectation, value, pass: minPass && maxPass };
+    });
+    return {
+      name: testCase.name,
+      pass: checks.every(check => check.pass),
+      boardClass: strategy.profile.boardInfo.primary,
+      handClass: strategy.profile.hand.handClass,
+      actions: strategy.actions.map(action => ({ name: action.name, pct: action.pct })),
+      checks,
+    };
+  });
+}
+
+function runPostflopStrategyLatencyTests(iterations = 50) {
+  const now = () => (typeof performance !== 'undefined' ? performance.now() : Date.now());
+  const contexts = POSTFLOP_STRATEGY_TEST_CASES.map(buildStrategyTestContext);
+  const timings = [];
+  for (let i = 0; i < iterations; i++) {
+    for (const ctx of contexts) {
+      const start = now();
+      getRecommendation(ctx, null);
+      timings.push(now() - start);
+    }
+  }
+  const sorted = [...timings].sort((a, b) => a - b);
+  const p95 = sorted[Math.floor(sorted.length * 0.95)] || 0;
+  const max = sorted[sorted.length - 1] || 0;
+  return {
+    iterations,
+    cases: contexts.length,
+    samples: timings.length,
+    averageMs: timings.reduce((sum, value) => sum + value, 0) / Math.max(1, timings.length),
+    p95Ms: p95,
+    maxMs: max,
+    targetMs: 2000,
+    pass: max < 2000,
+  };
+}
+
+if (typeof window !== 'undefined') {
+  window.POSTFLOP_STRATEGY_TEST_CASES = POSTFLOP_STRATEGY_TEST_CASES;
+  window.runPostflopStrategyTests = runPostflopStrategyTests;
+  window.runPostflopStrategyLatencyTests = runPostflopStrategyLatencyTests;
+}
+
+function estimateLineState(preflopAction, flopAction, turnAction, street, effectiveStack = Number.POSITIVE_INFINITY) {
+  const hasStackLimit = Number.isFinite(Number(effectiveStack));
+  let remaining = hasStackLimit ? Math.max(0.1, Number(effectiveStack) || 100) : Number.POSITIVE_INFINITY;
+  let pot = preflopAction?.potBB || 6;
+
+  const preflopCommit = preflopAction?.commitmentBB ?? pot / 2;
+  if (hasStackLimit && preflopCommit > remaining) {
+    pot = Math.max(1, remaining * 2);
+    remaining = 0;
+  } else {
+    remaining -= preflopCommit;
+  }
+
+  const applyPostflopLine = (line) => {
+    if (!line) return;
+    const desiredCommit = pot * (line.commitmentMultiplier || 0);
+    const actualCommit = hasStackLimit ? Math.min(Math.max(0, remaining), desiredCommit) : desiredCommit;
+    pot += 2 * actualCommit;
+    remaining -= actualCommit;
+  };
+
+  if ((street === 'turn' || street === 'river') && flopAction) {
+    applyPostflopLine(flopAction);
+  }
+  if (street === 'river' && turnAction) {
+    applyPostflopLine(turnAction);
+  }
+
+  return {
+    pot: Math.max(1, Math.round(pot * 10) / 10),
+    remaining: hasStackLimit ? Math.max(0.1, Math.round(remaining * 10) / 10) : Number.POSITIVE_INFINITY,
+  };
+}
+
+function estimatePotForNode(preflopAction, flopAction, turnAction, street, effectiveStack = Number.POSITIVE_INFINITY) {
+  return estimateLineState(preflopAction, flopAction, turnAction, street, effectiveStack).pot;
+}
+
+function estimateRemainingStackForNode(preflopAction, flopAction, turnAction, street, effectiveStack) {
+  return estimateLineState(preflopAction, flopAction, turnAction, street, effectiveStack).remaining;
+}
+
+function estimateDecisionPotInfo(streetPot, decision, stackBB) {
+  const pot = Math.max(1, Number(streetPot) || 1);
+  const stack = Math.max(1, Number(stackBB) || 100);
+  const cap = amount => Math.max(0.1, Math.min(stack, amount));
+
+  if (!decision) {
+    return { streetPot: pot, potAtDecision: pot, label: 'No action selected' };
+  }
+
+  if (decision.type === 'facing-bet') {
+    const size = decision.betSize || 50;
+    const bet = cap(pot * size / 100);
+    return {
+      streetPot: pot,
+      potAtDecision: Math.round((pot + bet) * 10) / 10,
+      callAmount: Math.round(bet * 10) / 10,
+      finalPotIfCall: Math.round((pot + 2 * bet) * 10) / 10,
+      label: `Facing ${size}% bet`,
+    };
+  }
+
+  if (decision.type === 'facing-raise') {
+    const size = decision.initialBetSize || 50;
+    const openBet = cap(pot * size / 100);
+    const raiseTo = cap(openBet * POSTFLOP_RAISE_MULTIPLIER);
+    return {
+      streetPot: pot,
+      potAtDecision: Math.round((pot + openBet + raiseTo) * 10) / 10,
+      callAmount: Math.round(Math.max(0, raiseTo - openBet) * 10) / 10,
+      finalPotIfCall: Math.round((pot + 2 * raiseTo) * 10) / 10,
+      label: `${size}% bet raised 3x`,
+    };
+  }
+
+  if (decision.type === 'facing-3bet') {
+    const size = decision.initialBetSize || 50;
+    const openBet = cap(pot * size / 100);
+    const heroRaiseTo = cap(openBet * POSTFLOP_RAISE_MULTIPLIER);
+    const villain3BetTo = cap(openBet * POSTFLOP_3BET_MULTIPLIER);
+    return {
+      streetPot: pot,
+      potAtDecision: Math.round((pot + heroRaiseTo + villain3BetTo) * 10) / 10,
+      callAmount: Math.round(Math.max(0, villain3BetTo - heroRaiseTo) * 10) / 10,
+      finalPotIfCall: Math.round((pot + 2 * villain3BetTo) * 10) / 10,
+      label: `${size}% bet, raise, 3-bet`,
+    };
+  }
+
+  return {
+    streetPot: pot,
+    potAtDecision: pot,
+    label: decision.type === 'checked-to' ? 'Checked to Hero' : 'Hero first to act',
+  };
+}
+
+// ============================================================
+// HELPERS
+// ============================================================
+
+function isHeroIP(heroPos, villainPos) {
+  return POSTFLOP_ORDER.indexOf(heroPos) > POSTFLOP_ORDER.indexOf(villainPos);
+}
+
+function generateCombos(r1, r2, type) {
+  if (r1 === r2) {
+    const out = [];
+    for (let i = 0; i < SUITS.length; i++) {
+      for (let j = i + 1; j < SUITS.length; j++) {
+        out.push([{ rank: r1, suit: SUITS[i] }, { rank: r2, suit: SUITS[j] }]);
+      }
+    }
+    return out;
+  }
+  if (type === 'suited') {
+    return SUITS.map(s => [{ rank: r1, suit: s }, { rank: r2, suit: s }]);
+  }
+  const out = [];
+  SUITS.forEach(s1 => SUITS.forEach(s2 => {
+    if (s1 !== s2) out.push([{ rank: r1, suit: s1 }, { rank: r2, suit: s2 }]);
+  }));
+  return out;
+}
+
+// ============================================================
+// CARD COMPONENTS
+// ============================================================
+
+function Card({ rank, suit, size = 'md', dim = false }) {
+  if (!rank || !suit) return null;
+  const sizes = {
+    sm: { w: 32, h: 44, fs: 14, sf: 16 },
+    md: { w: 48, h: 68, fs: 22, sf: 24 },
+    lg: { w: 64, h: 92, fs: 30, sf: 34 },
+    xl: { w: 80, h: 112, fs: 38, sf: 42 },
+  };
+  const sz = sizes[size];
+  const suitColor = SUIT_COLORS[suit];
+  return (
+    <div style={{
+      width: sz.w,
+      height: sz.h,
+      background: dim ? '#1a1c1a' : '#fbf8f0',
+      color: dim ? '#6a655c' : suitColor,
+      borderRadius: 6,
+      border: '1px solid #2a2c29',
+      display: 'flex',
+      flexDirection: 'column',
+      alignItems: 'center',
+      justifyContent: 'center',
+      fontFamily: 'Fraunces, Georgia, serif',
+      fontWeight: 600,
+      lineHeight: 1,
+      boxShadow: dim ? 'none' : '0 4px 12px rgba(0,0,0,0.4), inset 0 1px 0 rgba(255,255,255,0.4)',
+      opacity: dim ? 0.35 : 1,
+      userSelect: 'none',
+    }}>
+      <div style={{ fontSize: sz.fs }}>{rank}</div>
+      <div style={{ fontSize: sz.sf, marginTop: 2 }}>{SUIT_SYMBOLS[suit]}</div>
+    </div>
+  );
+}
+
+function HandChart({ onSelect, selected }) {
+  return (
+    <div style={{ display: 'grid', gridTemplateColumns: 'repeat(13, 1fr)', gap: 2, maxWidth: 560 }}>
+      {RANKS.map((r1, i) => RANKS.map((r2, j) => {
+        let type, label;
+        if (i === j) { type = 'pair'; label = r1 + r2; }
+        else if (i < j) { type = 'suited'; label = r1 + r2 + 's'; }
+        else { type = 'offsuit'; label = r2 + r1 + 'o'; }
+
+        const v1 = Math.max(RANK_VAL[r1], RANK_VAL[r2]);
+        const v2 = Math.min(RANK_VAL[r1], RANK_VAL[r2]);
+        const gap = v1 - v2;
+        let bg, fg;
+        if (type === 'pair') {
+          if (v1 >= 10) { bg = '#2c5e44'; fg = '#ebe7da'; }
+          else if (v1 >= 7) { bg = '#244836'; fg = '#cfc9b8'; }
+          else { bg = '#1c2920'; fg = '#9a9485'; }
+        } else if (type === 'suited') {
+          if (v1 === 14 && v2 >= 10) { bg = '#2c5e44'; fg = '#ebe7da'; }
+          else if (v1 >= 12 && gap <= 3) { bg = '#244836'; fg = '#cfc9b8'; }
+          else if (gap <= 1 && v1 >= 7) { bg = '#1c2920'; fg = '#9a9485'; }
+          else { bg = '#161816'; fg = '#5a564c'; }
+        } else {
+          if (v1 === 14 && v2 >= 11) { bg = '#244836'; fg = '#cfc9b8'; }
+          else if (v1 >= 12 && v2 >= 10) { bg = '#1c2920'; fg = '#9a9485'; }
+          else { bg = '#161816'; fg = '#4a463c'; }
+        }
+
+        const isSelected = selected && selected.label === label;
+        return (
+          <button
+            key={`${i}-${j}`}
+            onClick={() => onSelect({ r1: i < j ? r1 : r2, r2: i < j ? r2 : r1, type, label })}
+            style={{
+              aspectRatio: '1',
+              background: isSelected ? '#c9a961' : bg,
+              color: isSelected ? '#0d0e0c' : fg,
+              border: isSelected ? '1px solid #c9a961' : '1px solid #2a2c29',
+              borderRadius: 3,
+              fontSize: 11,
+              fontFamily: 'JetBrains Mono, monospace',
+              fontWeight: 600,
+              cursor: 'pointer',
+              padding: 0,
+              transition: 'transform 0.08s',
+            }}
+            onMouseEnter={e => e.currentTarget.style.transform = 'scale(1.08)'}
+            onMouseLeave={e => e.currentTarget.style.transform = 'scale(1)'}
+          >
+            {label}
+          </button>
+        );
+      }))}
+    </div>
+  );
+}
+
+function handCellLabel(r1, r2, rowIdx, colIdx) {
+  if (rowIdx === colIdx) return r1 + r2;
+  if (rowIdx < colIdx) return r1 + r2 + 's';
+  return r2 + r1 + 'o';
+}
+
+function rangeComboCount(rangeSet) {
+  if (!rangeSet || rangeSet.size === 0) return 0;
+  let count = 0;
+  rangeSet.forEach(hand => {
+    if (hand.length === 2) count += 6;
+    else if (hand.endsWith('s')) count += 4;
+    else if (hand.endsWith('o')) count += 12;
+  });
+  return count;
+}
+
+function comboRangeSet(combos) {
+  const out = new Set();
+  (combos || []).forEach(combo => out.add(_comboToHand(combo).label));
+  return out;
+}
+
+function allHandLabels() {
+  return RANKS.flatMap((r1, i) => RANKS.map((r2, j) => handCellLabel(r1, r2, i, j)));
+}
+
+const PREFLOP_ACTION_META = {
+  raise: { label: 'Raise', className: 'action-raise' },
+  call: { label: 'Call', className: 'action-call' },
+  fold: { label: 'Fold', className: 'action-fold' },
+};
+
+function unionRanges(...ranges) {
+  const out = new Set();
+  ranges.forEach(range => (range || new Set()).forEach(hand => out.add(hand)));
+  return out;
+}
+
+function buildPreflopActionMap({ raise = new Set(), call = new Set() } = {}) {
+  const actionMap = {};
+  allHandLabels().forEach(hand => {
+    actionMap[hand] = 'fold';
+  });
+  call.forEach(hand => {
+    actionMap[hand] = 'call';
+  });
+  raise.forEach(hand => {
+    actionMap[hand] = 'raise';
+  });
+  return actionMap;
+}
+
+function rfiStrategyView(pos, label = null) {
+  const raise = RFI_RANGES[pos] || new Set();
+  return rangeView(
+    raise,
+    label || `${pos} RFI strategy`,
+    null,
+    buildPreflopActionMap({ raise })
+  );
+}
+
+function facingPfrStrategyView(pos, opener, label = null) {
+  const raise = THREEBET_RANGES[`vs${opener}`] || THREEBET_RANGES.vsMP || new Set();
+  const call = resolveRangeFacingPfr(pos, opener);
+  return rangeView(
+    unionRanges(raise, call),
+    label || `${pos} vs ${opener} raise strategy`,
+    null,
+    buildPreflopActionMap({ raise, call })
+  );
+}
+
+function facingThreeBetStrategyView(pos, label = null) {
+  const raise = FOURBET_RANGES[pos] || new Set();
+  const call = CALL_VS_3BET_RANGES[pos] || new Set();
+  return rangeView(
+    unionRanges(raise, call),
+    label || `${pos} vs 3-bet strategy`,
+    null,
+    buildPreflopActionMap({ raise, call })
+  );
+}
+
+function facingFourBetStrategyView(pos, label = null) {
+  const call = CALL_VS_4BET_RANGES[pos] || new Set();
+  return rangeView(
+    call,
+    label || `${pos} vs 4-bet strategy`,
+    null,
+    buildPreflopActionMap({ call })
+  );
+}
+
+function resolveHeroPreflopRange(preflopAction, heroPos) {
+  if (!heroPos) return new Set();
+  if (!preflopAction) return RFI_RANGES[heroPos] || new Set();
+  const heroIsOpener = preflopAction.opener === heroPos;
+
+  if (preflopAction.potType === 'SRP') {
+    if (heroIsOpener) return RFI_RANGES[heroPos] || new Set();
+    const key = `${heroPos}|${preflopAction.opener}`;
+    return DEFEND_RANGES[key] || resolveDefaultDefendRange(heroPos, preflopAction.opener);
+  }
+  if (preflopAction.potType === '3BP') {
+    if (heroIsOpener) return CALL_VS_3BET_RANGES[heroPos] || new Set();
+    return THREEBET_RANGES[`vs${preflopAction.opener}`] || THREEBET_RANGES.vsMP || new Set();
+  }
+  if (preflopAction.potType === '4BP') {
+    if (heroIsOpener) return FOURBET_RANGES[heroPos] || new Set();
+    return CALL_VS_4BET_RANGES[heroPos] || new Set();
+  }
+  return new Set();
+}
+
+function describePreflopRangeRole(preflopAction, pos, fallback = 'range') {
+  if (!pos) return fallback;
+  if (!preflopAction) return `${pos} RFI range`;
+  const isOpener = preflopAction.opener === pos;
+
+  if (preflopAction.potType === 'SRP') {
+    return isOpener
+      ? `${pos} RFI range`
+      : `${pos} calling range vs ${preflopAction.opener} raise`;
+  }
+  if (preflopAction.potType === '3BP') {
+    return isOpener
+      ? `${pos} call-vs-3bet range`
+      : `${pos} 3-bet range vs ${preflopAction.opener} PFR`;
+  }
+  if (preflopAction.potType === '4BP') {
+    return isOpener
+      ? `${pos} 4-bet range`
+      : `${pos} call-vs-4bet range`;
+  }
+  return `${pos} ${fallback}`;
+}
+
+function resolvePreflopStrategyView(preflopAction, pos) {
+  if (!pos) return rangeView(new Set(), 'Choose player');
+  if (!preflopAction) return rfiStrategyView(pos, `${pos} RFI strategy`);
+  const isOpener = preflopAction.opener === pos;
+
+  if (preflopAction.potType === 'SRP') {
+    return isOpener
+      ? rfiStrategyView(pos, `${pos} RFI strategy`)
+      : facingPfrStrategyView(pos, preflopAction.opener, `${pos} calling strategy vs ${preflopAction.opener} raise`);
+  }
+  if (preflopAction.potType === '3BP') {
+    return isOpener
+      ? facingThreeBetStrategyView(pos, `${pos} strategy facing 3-bet`)
+      : facingPfrStrategyView(pos, preflopAction.opener, `${pos} 3-bet strategy vs ${preflopAction.opener}`);
+  }
+  if (preflopAction.potType === '4BP') {
+    return isOpener
+      ? facingThreeBetStrategyView(pos, `${pos} 4-bet strategy`)
+      : facingFourBetStrategyView(pos, `${pos} strategy facing 4-bet`);
+  }
+  return rangeView(resolveHeroPreflopRange(preflopAction, pos), describePreflopRangeRole(preflopAction, pos, 'preflop range'));
+}
+
+function rangeView(rangeSet, label, comboCount = null, actionMap = null) {
+  return { rangeSet: rangeSet || new Set(), label, comboCount, actionMap };
+}
+
+function resolveRangeFacingPfr(pos, opener) {
+  if (!pos || !opener) return new Set();
+  const key = `${pos}|${opener}`;
+  return DEFEND_RANGES[key] || resolveDefaultDefendRange(pos, opener);
+}
+
+function resolvePartialPreflopRange(preflopSequence, targetRole, targetPos) {
+  if (!targetPos) return rangeView(new Set(), 'Choose player');
+
+  const raises = (preflopSequence || []).filter(item => item.action === 'raise');
+  if (raises.length === 0) {
+    return rfiStrategyView(targetPos, `${targetPos} RFI strategy`);
+  }
+
+  const opener = raises[0];
+  const openerPos = opener.position;
+  const isOpener = opener.actor === targetRole;
+
+  if (raises.length === 1) {
+    return isOpener
+      ? rfiStrategyView(targetPos, `${targetPos} raise/RFI strategy`)
+      : facingPfrStrategyView(targetPos, openerPos, `${targetPos} facing ${openerPos} raise strategy`);
+  }
+
+  const threeBettor = raises[1];
+  if (raises.length === 2) {
+    return threeBettor.actor === targetRole
+      ? facingPfrStrategyView(targetPos, openerPos, `${targetPos} 3-bet strategy vs ${openerPos}`)
+      : facingThreeBetStrategyView(targetPos, `${targetPos} facing 3-bet strategy`);
+  }
+
+  const fourBettor = raises[2];
+  return fourBettor.actor === targetRole
+    ? facingThreeBetStrategyView(targetPos, `${targetPos} 4-bet strategy`)
+    : facingFourBetStrategyView(targetPos, `${targetPos} facing 4-bet strategy`);
+}
+
+function RangeMatrix({ title, subtitle, rangeSet, comboCount, accent = '#4a8b6a', actionMap = null }) {
+  const combos = comboCount ?? rangeComboCount(rangeSet);
+  return (
+    <section className="range-card">
+      <div className="panel-heading">
+        <div>
+          <h3>{title}</h3>
+          <p>{subtitle}</p>
+        </div>
+        <span className="mini-stat">{combos} combos</span>
+      </div>
+      {actionMap && (
+        <div className="range-legend">
+          <span><i className="legend-dot action-raise" /> Raise</span>
+          <span><i className="legend-dot action-call" /> Call</span>
+          <span><i className="legend-dot action-fold" /> Fold</span>
+        </div>
+      )}
+      <div className="range-grid">
+        {RANKS.map((r1, i) => RANKS.map((r2, j) => {
+          const label = handCellLabel(r1, r2, i, j);
+          const action = actionMap?.[label] || null;
+          const active = actionMap ? action !== 'fold' : rangeSet?.has(label);
+          const diagonal = i === j;
+          const actionClass = action ? PREFLOP_ACTION_META[action]?.className : '';
+          const actionLabel = action ? PREFLOP_ACTION_META[action]?.label : (active ? 'In range' : 'Out of range');
+          return (
+            <div
+              key={`${r1}-${r2}`}
+              className={`range-cell ${active ? 'active' : ''} ${diagonal ? 'pair' : ''} ${actionClass}`}
+              style={!action && active ? { '--range-accent': accent } : undefined}
+              title={`${label}: ${actionLabel}`}
+            >
+              {label}
+            </div>
+          );
+        }))}
+      </div>
+    </section>
+  );
+}
+
+function CardPicker({ disabled, onPick, selectedCards }) {
+  return (
+    <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
+      {SUITS.map(suit => (
+        <div key={suit} style={{ display: 'flex', gap: 4, flexWrap: 'nowrap', overflowX: 'auto', paddingBottom: 2 }}>
+          {RANKS.map(rank => {
+            const card = { rank, suit };
+            const key = rank + suit;
+            const isDisabled = disabled.some(c => c.rank === rank && c.suit === suit);
+            const isSelected = selectedCards.some(c => c && c.rank === rank && c.suit === suit);
+            return (
+              <button
+                key={key}
+                disabled={isDisabled}
+                title={`${rank} of ${SUIT_NAMES[suit]}`}
+                onClick={() => onPick(card)}
+                style={{
+                  width: 34,
+                  height: 46,
+                  background: isSelected ? '#c9a961' : isDisabled ? '#161816' : '#fbf8f0',
+                  color: isSelected ? '#0d0e0c' : isDisabled ? '#3a3a36' : SUIT_COLORS[suit],
+                  border: '1px solid #2a2c29',
+                  borderRadius: 4,
+                  fontFamily: 'Fraunces, Georgia, serif',
+                  fontWeight: 600,
+                  fontSize: 13,
+                  cursor: isDisabled ? 'not-allowed' : 'pointer',
+                  opacity: isDisabled ? 0.3 : 1,
+                  display: 'flex',
+                  flexDirection: 'column',
+                  alignItems: 'center',
+                  justifyContent: 'center',
+                  padding: 0,
+                  lineHeight: 1,
+                }}
+              >
+                <span>{rank}</span>
+                <span style={{ fontSize: 14 }}>{SUIT_SYMBOLS[suit]}</span>
+              </button>
+            );
+          })}
+        </div>
+      ))}
+    </div>
+  );
+}
+
+// ============================================================
+// MAIN APP
+// ============================================================
+
+function App() {
+  const [street, setStreet] = useState('flop');
+  const [heroPos, setHeroPos] = useState(null);
+  const [heroStack, setHeroStack] = useState(100);
+  const [heroHand, setHeroHand] = useState(null);
+  const [holeInput, setHoleInput] = useState('');
+  const [holePickerCards, setHolePickerCards] = useState([null, null]);
+  const [pickingHoleIdx, setPickingHoleIdx] = useState(0);
+  const [showHolePicker, setShowHolePicker] = useState(false);
+  const [combo, setCombo] = useState(null);
+  const [villainPos, setVillainPos] = useState(null);
+  const [villainStack, setVillainStack] = useState(100);
+  const [preflopActionId, setPreflopActionId] = useState('');
+  const [flopActionId, setFlopActionId] = useState('');
+  const [turnActionId, setTurnActionId] = useState('');
+  const [board, setBoard] = useState([null, null, null, null, null]);
+  const [potBB, setPotBB] = useState(6);
+  const [currentDecisionId, setCurrentDecisionId] = useState('');
+  const [pickingBoardIdx, setPickingBoardIdx] = useState(0);
+  const [boardInput, setBoardInput] = useState('');
+  const [showBoardPicker, setShowBoardPicker] = useState(false);
+  const [solverNodeJson, setSolverNodeJson] = useState('');
+  const [equityResult, setEquityResult] = useState(null);
+  const [preflopSequence, setPreflopSequence] = useState([]);
+  const [streetActionSequence, setStreetActionSequence] = useState([]);
+  const [actionLog, setActionLog] = useState([]);
+  const defaultActionSize = 50;
+  const [handEnded, setHandEnded] = useState(false);
+
+  // ----- AUTO-SCROLL REFS -----
+  const refHero = useRef(null);
+  const refHole = useRef(null);
+  const refVillain = useRef(null);
+  const refPreflop = useRef(null);
+  const refBoard = useRef(null);
+  const refDecision = useRef(null);
+  const refResult = useRef(null);
+  const refAdvance = useRef(null);
+
+  const scrollTo = (ref) => {
+    if (ref.current) {
+      setTimeout(() => {
+        ref.current?.scrollIntoView({ behavior: 'smooth', block: 'start' });
+      }, 120);
+    }
+  };
+
+  const positions = POSITIONS_8;
+  const heroIP = heroPos && villainPos ? isHeroIP(heroPos, villainPos) : null;
+  const effectiveStack = Math.min(heroStack, villainStack);
+  const boardCardCount = STREET_CONFIG[street].cards;
+  const streetLabel = STREET_CONFIG[street].label;
+  const boardCards = useMemo(() => board.slice(0, boardCardCount), [board, boardCardCount]);
+  const boardComplete = boardCardCount > 0 && boardCards.every(c => c !== null);
+
+  const preflopOptions = useMemo(() => {
+    if (!heroPos || !villainPos) return [];
+    return PREFLOP_LINES.filter(line => line.players.includes(heroPos) && line.players.includes(villainPos));
+  }, [heroPos, villainPos]);
+
+  const flopActionOptions = useMemo(() => makePostflopLines(heroIP), [heroIP]);
+  const turnActionOptions = useMemo(() => makePostflopLines(heroIP), [heroIP]);
+  const currentDecisionOptions = useMemo(() => getDecisionOptions(heroIP), [heroIP]);
+
+  const selectedPreflopAction = useMemo(
+    () => PREFLOP_LINES.find(line => line.id === preflopActionId) || null,
+    [preflopActionId]
+  );
+  const selectedFlopAction = useMemo(
+    () => flopActionOptions.find(line => line.id === flopActionId) || null,
+    [flopActionOptions, flopActionId]
+  );
+  const selectedTurnAction = useMemo(
+    () => turnActionOptions.find(line => line.id === turnActionId) || null,
+    [turnActionOptions, turnActionId]
+  );
+  const currentDecision = useMemo(
+    () => currentDecisionOptions.find(option => option.id === currentDecisionId) || null,
+    [currentDecisionOptions, currentDecisionId]
+  );
+  const remainingStackBB = useMemo(
+    () => estimateRemainingStackForNode(selectedPreflopAction, selectedFlopAction, selectedTurnAction, street, effectiveStack),
+    [selectedPreflopAction, selectedFlopAction, selectedTurnAction, street, effectiveStack]
+  );
+  const decisionPotInfo = useMemo(
+    () => estimateDecisionPotInfo(potBB, currentDecision, remainingStackBB),
+    [potBB, currentDecision, remainingStackBB]
+  );
+
+  const precedingActionComplete = Boolean(
+    selectedPreflopAction &&
+    (street === 'flop' || selectedFlopAction) &&
+    (street !== 'river' || selectedTurnAction)
+  );
+  const streetIndex = STREET_SEQUENCE.indexOf(street);
+  const recommendationNumber = streetIndex + 1;
+
+  const handEval = useMemo(() => {
+    if (combo && boardComplete) return evalHand(combo, boardCards);
+    return null;
+  }, [combo, boardCards, boardComplete]);
+
+  const solverJsonResult = useMemo(() => parseSolverNodeJson(solverNodeJson), [solverNodeJson]);
+
+  const analysisContext = useMemo(() => {
+    if (!handEval || !currentDecision || !precedingActionComplete) return null;
+    return {
+      street,
+      heroPos,
+      villainPos,
+      combo,
+      boardCards,
+      handEval,
+      currentDecision,
+      preflopAction: selectedPreflopAction,
+      flopAction: selectedFlopAction,
+      turnAction: selectedTurnAction,
+      heroIP,
+      stackBB: remainingStackBB,
+      potBB,
+    };
+  }, [
+    handEval,
+    currentDecision,
+    precedingActionComplete,
+    street,
+    heroPos,
+    villainPos,
+    combo,
+    boardCards,
+    selectedPreflopAction,
+    selectedFlopAction,
+    selectedTurnAction,
+    heroIP,
+    remainingStackBB,
+    potBB,
+  ]);
+
+  const recommendation = useMemo(() => {
+    if (!analysisContext) return null;
+    return getRecommendation(analysisContext, solverJsonResult.node);
+  }, [
+    analysisContext,
+    solverJsonResult.node,
+  ]);
+  const canAdvanceToTurn = Boolean(recommendation && street === 'flop');
+  const canAdvanceToRiver = Boolean(recommendation && street === 'turn');
+  const heroRangeView = useMemo(() => {
+    if (selectedPreflopAction) {
+      return resolvePreflopStrategyView(selectedPreflopAction, heroPos);
+    }
+    return resolvePartialPreflopRange(preflopSequence, 'Hero', heroPos);
+  }, [selectedPreflopAction, heroPos, preflopSequence]);
+
+  const villainRangeView = useMemo(() => {
+    if (analysisContext) {
+      const ctx = computeRangeContext(analysisContext);
+      return {
+        rangeSet: comboRangeSet(ctx.villainCombos),
+        comboCount: ctx.vCount,
+        label: ctx.rangeLabel || `${villainPos || 'Villain'} perceived range`,
+      };
+    }
+    if (selectedPreflopAction) {
+      return resolvePreflopStrategyView(selectedPreflopAction, villainPos);
+    }
+    return resolvePartialPreflopRange(preflopSequence, 'Villain', villainPos);
+  }, [analysisContext, selectedPreflopAction, preflopSequence, heroPos, villainPos]);
+
+  useEffect(() => {
+    if (!analysisContext || !recommendation) {
+      setEquityResult(null);
+      return undefined;
+    }
+
+    const rangeCtx = computeRangeContext(analysisContext);
+    setEquityResult({
+      status: 'queued',
+      equity: null,
+      vCount: rangeCtx.vCount,
+      rangeLabel: rangeCtx.rangeLabel,
+      sourceLabel: `Equity queued off-path - ${rangeCtx.vCount || 0} combos`,
+    });
+
+    let cancelled = false;
+    const run = () => {
+      const start = typeof performance !== 'undefined' ? performance.now() : Date.now();
+      const eqCtx = computeEquityContext(analysisContext);
+      if (cancelled) return;
+      const end = typeof performance !== 'undefined' ? performance.now() : Date.now();
+      const equityMode = eqCtx.mode === 'exact' ? 'exact runout equity' : eqCtx.mode === 'mc' ? 'Monte Carlo equity' : 'equity unavailable';
+      setEquityResult({
+        status: 'ready',
+        equity: eqCtx.equity,
+        vCount: eqCtx.vCount,
+        rangeLabel: eqCtx.rangeLabel,
+        sourceLabel: `${equityMode} - ${eqCtx.samples || 0} samples - ${Math.round(end - start)} ms`,
+      });
+    };
+
+    let idleId = null;
+    let timeoutId = null;
+    if (typeof window !== 'undefined' && typeof window.requestIdleCallback === 'function') {
+      idleId = window.requestIdleCallback(run, { timeout: 1200 });
+    } else {
+      timeoutId = setTimeout(run, 180);
+    }
+
+    return () => {
+      cancelled = true;
+      if (idleId != null && typeof window !== 'undefined' && typeof window.cancelIdleCallback === 'function') {
+        window.cancelIdleCallback(idleId);
+      }
+      if (timeoutId != null) clearTimeout(timeoutId);
+    };
+  }, [analysisContext, recommendation?.nodeKey]);
+
+  useEffect(() => {
+    if (currentDecisionId && !currentDecisionOptions.some(option => option.id === currentDecisionId)) {
+      setCurrentDecisionId('');
+    }
+  }, [currentDecisionOptions, currentDecisionId]);
+
+  useEffect(() => {
+    if (
+      boardComplete &&
+      precedingActionComplete &&
+      heroIP === false &&
+      streetActionSequence.length === 0 &&
+      !currentDecisionId &&
+      !handEnded
+    ) {
+      setCurrentDecisionId('oop-hero-first-to-act');
+    }
+  }, [boardComplete, precedingActionComplete, heroIP, streetActionSequence.length, currentDecisionId, handEnded]);
+
+  // Auto-scroll cascade
+  // Removed: auto-scroll on heroPos — keeps position pills reachable for re-clicks.
+  useEffect(() => { if (combo) scrollTo(refVillain); }, [combo]);
+  // Removed: auto-scroll on villainPos — keeps villain pills reachable for re-clicks.
+  // Removed: auto-scroll on preflopActionId — keeps preflop pills reachable for re-clicks.
+  useEffect(() => { if (boardComplete) scrollTo(refDecision); }, [boardComplete]);
+  useEffect(() => { if (currentDecisionId) scrollTo(refResult); }, [currentDecisionId]);
+
+  // Keyboard shortcut: number keys 1..N select position when on hero/villain step
+  useEffect(() => {
+    function handleKey(e) {
+      const tag = (e.target.tagName || '').toLowerCase();
+      if (tag === 'input' || tag === 'textarea' || tag === 'select') return;
+      const num = parseInt(e.key, 10);
+      if (isNaN(num) || num < 1 || num > positions.length) return;
+      const pos = positions[num - 1];
+      if (!pos) return;
+      if (!heroPos) {
+        // No hero yet — set it (preserves heroHand/combo/board)
+        setHeroPos(pos);
+        setVillainPos(null);
+        setPreflopActionId(''); setFlopActionId(''); setTurnActionId('');
+        setStreet('flop'); setCurrentDecisionId('');
+      } else if (!villainPos && pos !== heroPos) {
+        // Hero set, no villain yet, pressed key isn't hero — set villain
+        setVillainPos(pos);
+        setPreflopActionId(''); setFlopActionId(''); setTurnActionId('');
+        setStreet('flop'); setCurrentDecisionId('');
+      }
+    }
+    window.addEventListener('keydown', handleKey);
+    return () => window.removeEventListener('keydown', handleKey);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [heroPos, villainPos, positions]);
+
+  // Auto-update pot estimate when preflop/flop/turn action selection changes.
+  // User can override by typing — but the estimate is refreshed every time the
+  // action tree changes, so the pot math stays in sync with the line you picked.
+  useEffect(() => {
+    const est = estimatePotForIds(preflopActionId, flopActionId, turnActionId);
+    if (est && est !== potBB) setPotBB(est);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [preflopActionId, flopActionId, turnActionId, street, effectiveStack]);
+
+  const resetFrom = (step) => {
+    if (step <= 1) { setHeroPos(null); }
+    if (step <= 2) {
+      setHeroHand(null);
+      setCombo(null);
+      setHolePickerCards([null, null]);
+      setPickingHoleIdx(0);
+      setShowHolePicker(false);
+    }
+    if (step <= 3) { setVillainPos(null); }
+    if (step <= 4) {
+      setPreflopActionId('');
+      setFlopActionId('');
+      setTurnActionId('');
+      setPreflopSequence([]);
+      setStreetActionSequence([]);
+      setActionLog([]);
+      setStreet('flop');
+      setPotBB(6);
+    }
+    if (step <= 5) {
+      setBoard([null, null, null, null, null]);
+      setPickingBoardIdx(0);
+      setShowBoardPicker(false);
+      setStreet('flop');
+      setStreetActionSequence([]);
+    }
+    if (step <= 6) { setCurrentDecisionId(''); setStreetActionSequence([]); }
+    setHandEnded(false);
+    setEquityResult(null);
+  };
+
+  const estimatePotForIds = (preId, flopId, turnId, targetStreet = street) => {
+    const pre = PREFLOP_LINES.find(line => line.id === preId) || null;
+    const flopLine = flopActionOptions.find(line => line.id === flopId) || null;
+    const turnLine = turnActionOptions.find(line => line.id === turnId) || null;
+    return estimatePotForNode(pre, flopLine, turnLine, targetStreet, effectiveStack);
+  };
+
+  const advanceToTurn = (flopLineId) => {
+    if (!flopLineId) return;
+    setFlopActionId(flopLineId);
+    setTurnActionId('');
+    setStreet('turn');
+    setPotBB(estimatePotForIds(preflopActionId, flopLineId, '', 'turn'));
+    setCurrentDecisionId('');
+    setPickingBoardIdx(3);
+    setShowBoardPicker(false);
+    setStreetActionSequence([]);
+    setEquityResult(null);
+    setTimeout(() => scrollTo(refBoard), 120);
+  };
+
+  const advanceToRiver = (turnLineId) => {
+    if (!turnLineId) return;
+    setTurnActionId(turnLineId);
+    setStreet('river');
+    setPotBB(estimatePotForIds(preflopActionId, flopActionId, turnLineId, 'river'));
+    setCurrentDecisionId('');
+    setPickingBoardIdx(4);
+    setShowBoardPicker(false);
+    setStreetActionSequence([]);
+    setEquityResult(null);
+    setTimeout(() => scrollTo(refBoard), 120);
+  };
+
+  const resetVisibleBoard = () => {
+    const nextBoard = [...board];
+    const start = street === 'flop' ? 0 : street === 'turn' ? 3 : 4;
+    for (let i = start; i < boardCardCount; i++) nextBoard[i] = null;
+    setBoard(nextBoard);
+    setPickingBoardIdx(start);
+    setShowBoardPicker(false);
+    setCurrentDecisionId('');
+    setStreetActionSequence([]);
+    setEquityResult(null);
+  };
+
+  const otherRole = role => role === 'Hero' ? 'Villain' : 'Hero';
+  const rolePosition = role => role === 'Hero' ? heroPos : villainPos;
+  const roleLabel = role => `${role}${rolePosition(role) ? ` (${rolePosition(role)})` : ''}`;
+
+  const selectHeroPosition = (pos) => {
+    if (heroPos === pos) return;
+    setHeroPos(pos);
+    setVillainPos(null);
+    setPreflopActionId('');
+    setFlopActionId('');
+    setTurnActionId('');
+    setPreflopSequence([]);
+    setStreetActionSequence([]);
+    setActionLog([]);
+    setHolePickerCards([null, null]);
+    setPickingHoleIdx(0);
+    setShowHolePicker(false);
+    setBoard([null, null, null, null, null]);
+    setPickingBoardIdx(0);
+    setShowBoardPicker(false);
+    setStreet('flop');
+    setPotBB(6);
+    setCurrentDecisionId('');
+    setHandEnded(false);
+    setEquityResult(null);
+  };
+
+  const selectVillainPosition = (pos) => {
+    if (villainPos === pos || pos === heroPos) return;
+    setVillainPos(pos);
+    setPreflopActionId('');
+    setFlopActionId('');
+    setTurnActionId('');
+    setPreflopSequence([]);
+    setStreetActionSequence([]);
+    setActionLog([]);
+    setBoard([null, null, null, null, null]);
+    setPickingBoardIdx(0);
+    setShowBoardPicker(false);
+    setStreet('flop');
+    setPotBB(6);
+    setCurrentDecisionId('');
+    setHandEnded(false);
+    setEquityResult(null);
+  };
+
+  const submitHoleInput = () => {
+    const parsed = _parseHoleInput(holeInput);
+    if (!parsed) return;
+    if (parsed.type === 'combo') {
+      setHeroHand(_comboToHand(parsed.combo));
+      setCombo(parsed.combo);
+      setHolePickerCards(parsed.combo);
+    } else {
+      setHeroHand(parsed.hand);
+      setCombo(null);
+      setHolePickerCards([null, null]);
+    }
+    setHoleInput('');
+    setShowHolePicker(false);
+  };
+
+  const pickHoleCard = (card) => {
+    const nextCards = [...holePickerCards];
+    nextCards[pickingHoleIdx] = card;
+    setHolePickerCards(nextCards);
+
+    const nextIdx = nextCards.findIndex(c => c === null);
+    if (nextIdx !== -1) {
+      setPickingHoleIdx(nextIdx);
+      return;
+    }
+
+    setHeroHand(_comboToHand(nextCards));
+    setCombo(nextCards);
+    setHoleInput('');
+    setShowHolePicker(false);
+  };
+
+  const appendActionLog = (entry) => {
+    setActionLog(prev => [
+      ...prev,
+      {
+        ...entry,
+        id: `${entry.street}-${prev.length}`,
+      },
+    ]);
+  };
+
+  const firstPreflopActor = () => {
+    if (!heroPos || !villainPos) return null;
+    return positionIndex(heroPos) <= positionIndex(villainPos) ? 'Hero' : 'Villain';
+  };
+
+  const expectedPreflopActor = (seq = preflopSequence) => {
+    const first = firstPreflopActor();
+    if (!first || selectedPreflopAction || handEnded) return null;
+    return seq.length % 2 === 0 ? first : otherRole(first);
+  };
+
+  const preflopLineFromSequence = (seq) => {
+    if (seq.some(item => item.action === 'fold')) return null;
+    const actions = seq.map(item => item.action);
+    if (actions[0] !== 'raise') return null;
+
+    const openerRole = seq[0].actor;
+    const defenderRole = otherRole(openerRole);
+    const opener = rolePosition(openerRole);
+    const defender = rolePosition(defenderRole);
+    if (!opener || !defender) return null;
+
+    let label = null;
+    if (actions.length === 2 && actions[1] === 'call') {
+      label = `${opener} raise ${defender} call`;
+    } else if (actions.length === 3 && actions[1] === 'raise' && actions[2] === 'call') {
+      label = `${opener} raise ${defender} 3bet ${opener} call`;
+    } else if (actions.length === 4 && actions[1] === 'raise' && actions[2] === 'raise' && actions[3] === 'call') {
+      label = `${opener} raise ${defender} 3bet ${opener} 4bet ${defender} call`;
+    }
+    if (!label) return null;
+    return PREFLOP_LINES.find(line => line.label === label) || null;
+  };
+
+  const finishPreflopLine = (line) => {
+    setPreflopActionId(line.id);
+    setFlopActionId('');
+    setTurnActionId('');
+    setStreet('flop');
+    setBoard([null, null, null, null, null]);
+    setPickingBoardIdx(0);
+    setShowBoardPicker(false);
+    setPotBB(estimatePotForIds(line.id, '', '', 'flop'));
+    setCurrentDecisionId('');
+    setStreetActionSequence([]);
+    setEquityResult(null);
+  };
+
+  const handlePreflopAction = (actor, action) => {
+    const expected = expectedPreflopActor();
+    if (actor !== expected) return;
+    const next = [...preflopSequence, { actor, position: rolePosition(actor), action }];
+    setPreflopSequence(next);
+    appendActionLog({
+      street: 'Preflop',
+      actor: roleLabel(actor),
+      action: action === 'raise' ? 'Raise' : action === 'call' ? 'Call' : 'Fold',
+    });
+
+    if (action === 'fold') {
+      setHandEnded(true);
+      setCurrentDecisionId('');
+      return;
+    }
+
+    const line = preflopLineFromSequence(next);
+    if (line) finishPreflopLine(line);
+  };
+
+  const firstPostflopActor = () => {
+    if (heroIP === null) return null;
+    return heroIP ? 'Villain' : 'Hero';
+  };
+
+  const expectedPostflopActor = (seq = streetActionSequence) => {
+    const first = firstPostflopActor();
+    if (!first || !boardComplete || handEnded) return null;
+    return seq.length % 2 === 0 ? first : otherRole(first);
+  };
+
+  const postflopDecisionFromSequence = (seq) => {
+    if (!boardComplete || handEnded) return '';
+    const nextActor = expectedPostflopActor(seq);
+    if (nextActor !== 'Hero') return '';
+
+    const a = seq.map(item => item.action);
+    const bet = seq.find(item => item.action === 'bet');
+    const size = bet?.size || defaultActionSize;
+
+    if (heroIP) {
+      if (a.length === 1 && a[0] === 'check') return 'ip-villain-checks-to-hero';
+      if (a.length === 1 && a[0] === 'bet') return `ip-facing-villain-bet-${size}`;
+      if (a.length === 3 && a[0] === 'check' && a[1] === 'bet' && a[2] === 'raise') {
+        return `ip-villain-check-hero-bet-${size}-villain-checkraise`;
+      }
+      if (a.length === 3 && a[0] === 'bet' && a[1] === 'raise' && a[2] === 'raise') {
+        return `ip-villain-bet-${size}-hero-raise-villain-3bet`;
+      }
+      return '';
+    }
+
+    if (a.length === 0) return 'oop-hero-first-to-act';
+    if (a.length === 2 && a[0] === 'check' && a[1] === 'bet') {
+      return `oop-hero-check-facing-villain-bet-${size}`;
+    }
+    if (a.length === 4 && a[0] === 'check' && a[1] === 'bet' && a[2] === 'raise' && a[3] === 'raise') {
+      return `oop-hero-check-villain-bet-${size}-checkraise-villain-3bet`;
+    }
+    if (a.length === 2 && a[0] === 'bet' && a[1] === 'raise') {
+      return `oop-hero-bet-${size}-villain-raise`;
+    }
+    return '';
+  };
+
+  const completedPostflopLineId = (seq) => {
+    const a = seq.map(item => item.action);
+    const bet = seq.find(item => item.action === 'bet');
+    const size = bet?.size || defaultActionSize;
+
+    if (heroIP) {
+      if (a.length === 2 && a[0] === 'check' && a[1] === 'check') return 'ip-check-check';
+      if (a.length === 2 && a[0] === 'bet' && a[1] === 'call') return `ip-villain-bet-${size}-hero-call`;
+      if (a.length === 3 && a[0] === 'bet' && a[1] === 'raise' && a[2] === 'call') return `ip-villain-bet-${size}-hero-raise-call`;
+      if (a.length === 4 && a[0] === 'bet' && a[1] === 'raise' && a[2] === 'raise' && a[3] === 'call') return `ip-villain-bet-${size}-hero-raise-3bet-call`;
+      if (a.length === 3 && a[0] === 'check' && a[1] === 'bet' && a[2] === 'call') return `ip-check-hero-bet-${size}-call`;
+      if (a.length === 4 && a[0] === 'check' && a[1] === 'bet' && a[2] === 'raise' && a[3] === 'call') return `ip-check-hero-bet-${size}-checkraise-call`;
+      if (a.length === 5 && a[0] === 'check' && a[1] === 'bet' && a[2] === 'raise' && a[3] === 'raise' && a[4] === 'call') return `ip-check-hero-bet-${size}-checkraise-3bet-call`;
+      return '';
+    }
+
+    if (a.length === 2 && a[0] === 'check' && a[1] === 'check') return 'oop-check-check';
+    if (a.length === 3 && a[0] === 'check' && a[1] === 'bet' && a[2] === 'call') return `oop-hero-check-villain-bet-${size}-call`;
+    if (a.length === 4 && a[0] === 'check' && a[1] === 'bet' && a[2] === 'raise' && a[3] === 'call') return `oop-hero-check-villain-bet-${size}-checkraise-call`;
+    if (a.length === 5 && a[0] === 'check' && a[1] === 'bet' && a[2] === 'raise' && a[3] === 'raise' && a[4] === 'call') return `oop-hero-check-villain-bet-${size}-checkraise-3bet-call`;
+    if (a.length === 2 && a[0] === 'bet' && a[1] === 'call') return `oop-hero-bet-${size}-villain-call`;
+    if (a.length === 3 && a[0] === 'bet' && a[1] === 'raise' && a[2] === 'call') return `oop-hero-bet-${size}-villain-raise-call`;
+    if (a.length === 4 && a[0] === 'bet' && a[1] === 'raise' && a[2] === 'raise' && a[3] === 'call') return `oop-hero-bet-${size}-villain-raise-3bet-call`;
+    return '';
+  };
+
+  const finishPostflopLine = (lineId) => {
+    if (!lineId) return;
+    if (street === 'flop') {
+      advanceToTurn(lineId);
+      return;
+    }
+    if (street === 'turn') {
+      advanceToRiver(lineId);
+      return;
+    }
+    setCurrentDecisionId('');
+    setStreetActionSequence([]);
+    setHandEnded(true);
+  };
+
+  const handlePostflopAction = (actor, action, size = defaultActionSize) => {
+    const expected = expectedPostflopActor();
+    if (actor !== expected) return;
+
+    const next = [...streetActionSequence, { actor, position: rolePosition(actor), action, size }];
+    setStreetActionSequence(next);
+    appendActionLog({
+      street: STREET_CONFIG[street].label,
+      actor: roleLabel(actor),
+      action: action === 'bet' ? `Raise ${size}%` : action === 'raise' ? 'Raise' : action === 'call' ? 'Call' : action === 'check' ? 'Check' : 'Fold',
+    });
+
+    if (action === 'fold') {
+      setHandEnded(true);
+      setCurrentDecisionId('');
+      return;
+    }
+
+    const completeLineId = completedPostflopLineId(next);
+    if (completeLineId) {
+      finishPostflopLine(completeLineId);
+      return;
+    }
+
+    setCurrentDecisionId(postflopDecisionFromSequence(next));
+    setEquityResult(null);
+  };
+
+  const availablePlayerActions = (role) => {
+    if (!heroPos || !villainPos || !combo || handEnded) return [];
+
+    if (!selectedPreflopAction) {
+      const expected = expectedPreflopActor();
+      const raiseCount = preflopSequence.filter(item => item.action === 'raise').length;
+      const canCall = raiseCount > 0;
+      const canRaise = raiseCount < 3;
+      return [
+        { key: 'call', label: 'Call', disabled: role !== expected || !canCall, onClick: () => handlePreflopAction(role, 'call') },
+        { key: 'fold', label: 'Fold', disabled: role !== expected, onClick: () => handlePreflopAction(role, 'fold') },
+        { key: 'raise', label: 'Raise', disabled: role !== expected || !canRaise, onClick: () => handlePreflopAction(role, 'raise') },
+      ];
+    }
+
+    if (!boardComplete) return [];
+
+    const expected = expectedPostflopActor();
+    const last = streetActionSequence[streetActionSequence.length - 1];
+    const pressureCount = streetActionSequence.filter(item => item.action === 'bet' || item.action === 'raise').length;
+    const isEnabled = role === expected;
+
+    if (!last || last.action === 'check') {
+      return [
+        { key: 'check', label: 'Check', disabled: !isEnabled, onClick: () => handlePostflopAction(role, 'check') },
+        ...BET_SIZES.map(size => ({
+          key: `bet-${size}`,
+          label: `Raise ${size}%`,
+          disabled: !isEnabled,
+          onClick: () => handlePostflopAction(role, 'bet', size),
+        })),
+      ];
+    }
+
+    if (last.action === 'bet' || last.action === 'raise') {
+      return [
+        { key: 'call', label: 'Call', disabled: !isEnabled, onClick: () => handlePostflopAction(role, 'call') },
+        { key: 'fold', label: 'Fold', disabled: !isEnabled, onClick: () => handlePostflopAction(role, 'fold') },
+        { key: 'raise', label: pressureCount >= 3 ? 'Raise cap' : 'Raise', disabled: !isEnabled || pressureCount >= 3, onClick: () => handlePostflopAction(role, 'raise') },
+      ];
+    }
+
+    return [];
+  };
+
+  const submitBoardInput = () => {
+    const parsed = _parseBoardInput(boardInput);
+    if (parsed.length === 0) return;
+
+    const nextBoard = [...board];
+    if (street === 'flop') {
+      if (parsed.length !== 3) return;
+      parsed.forEach((card, idx) => { nextBoard[idx] = card; });
+    } else if (parsed.length === 1) {
+      nextBoard[boardCardCount - 1] = parsed[0];
+    } else if (parsed.length === boardCardCount) {
+      parsed.forEach((card, idx) => { nextBoard[idx] = card; });
+    } else {
+      return;
+    }
+
+    const seen = new Set(combo ? combo.map(c => c.rank + c.suit) : []);
+    for (const c of nextBoard.slice(0, boardCardCount).filter(Boolean)) {
+      const key = c.rank + c.suit;
+      if (seen.has(key)) return;
+      seen.add(key);
+    }
+
+    setBoard(nextBoard);
+    setPickingBoardIdx(boardCardCount - 1);
+    setBoardInput('');
+    setShowBoardPicker(false);
+    setCurrentDecisionId('');
+    setStreetActionSequence([]);
+    setEquityResult(null);
+  };
+
+  const flowStatus = (() => {
+    if (!heroPos) return 'Choose Hero position to start preflop.';
+    if (!combo) return 'Enter Hero hole cards.';
+    if (!villainPos) return 'Choose Villain for 1v1.';
+    if (handEnded) return 'Round ended.';
+    if (!selectedPreflopAction) {
+      const actor = expectedPreflopActor();
+      return actor ? `Preflop: ${roleLabel(actor)} to act.` : 'Preflop action needed.';
+    }
+    if (!boardComplete) return `Deal the ${streetLabel.toLowerCase()}.`;
+    const actor = expectedPostflopActor();
+    return actor ? `${streetLabel}: ${roleLabel(actor)} to act.` : `${streetLabel} action ready.`;
+  })();
+
+  const currentActionActor = (() => {
+    if (!combo || !villainPos || handEnded) return null;
+    if (!selectedPreflopAction) return expectedPreflopActor();
+    if (!boardComplete) return null;
+    return expectedPostflopActor();
+  })();
+  const currentActionItems = currentActionActor ? availablePlayerActions(currentActionActor) : [];
+
+  const disabledCards = combo ? [...combo, ...boardCards.filter(c => c !== null)] : [];
+  const tableReady = true;
+
+  return (
+    <div style={{
+      minHeight: '100vh',
+      background: '#0d0e0c',
+      color: '#ebe7da',
+      fontFamily: 'Manrope, system-ui, sans-serif',
+      padding: '32px 20px 60px',
+    }}>
+      <style>{`
+        @import url('https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,400;9..144,500;9..144,600;9..144,700&family=Manrope:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap');
+        * { box-sizing: border-box; }
+        button, select, input, textarea { font-family: inherit; }
+        .step-card {
+          background: linear-gradient(180deg, #161816 0%, #131513 100%);
+          border: 1px solid #242623;
+          border-radius: 12px;
+          padding: 24px;
+          margin-bottom: 16px;
+          position: relative;
+        }
+        .step-card.active {
+          border-color: #2c5e44;
+          box-shadow: 0 0 0 1px rgba(44, 94, 68, 0.3), 0 8px 32px rgba(0,0,0,0.4);
+        }
+        .step-card.done { opacity: 0.88; }
+        .step-num {
+          position: absolute;
+          top: -12px;
+          left: 24px;
+          background: #0d0e0c;
+          color: #c9a961;
+          padding: 2px 10px;
+          font-family: 'JetBrains Mono', monospace;
+          font-size: 11px;
+          letter-spacing: 1.5px;
+          border: 1px solid #2c5e44;
+          border-radius: 4px;
+        }
+        h2 {
+          font-family: 'Fraunces', serif;
+          font-weight: 500;
+          font-size: 22px;
+          margin: 0 0 4px;
+          color: #ebe7da;
+        }
+        .step-sub {
+          font-size: 13px;
+          color: #8a8478;
+          margin-bottom: 18px;
+          line-height: 1.5;
+        }
+        .control-label {
+          font-family: 'JetBrains Mono', monospace;
+          font-size: 10px;
+          color: #5a564c;
+          letter-spacing: 1.5px;
+          margin: 16px 0 8px;
+          text-transform: uppercase;
+        }
+        .pill-btn {
+          background: #1c1e1c;
+          border: 1px solid #2a2c29;
+          color: #cfc9b8;
+          padding: 10px 18px;
+          border-radius: 6px;
+          font-size: 13px;
+          font-weight: 500;
+          cursor: pointer;
+          transition: all 0.15s;
+        }
+        .pill-btn:hover:not(:disabled) {
+          border-color: #4a8b6a;
+          color: #ebe7da;
+        }
+        .pill-btn.selected {
+          background: #2c5e44;
+          border-color: #4a8b6a;
+          color: #ebe7da;
+        }
+        .pill-btn:disabled {
+          opacity: 0.35;
+          cursor: not-allowed;
+        }
+        .stack-input, .select-input, .solver-input {
+          background: #1c1e1c;
+          border: 1px solid #2a2c29;
+          color: #ebe7da;
+          padding: 8px 12px;
+          border-radius: 6px;
+          font-family: 'JetBrains Mono', monospace;
+          font-size: 13px;
+        }
+        .stack-input { width: 90px; }
+        .select-input { width: 100%; max-width: 720px; }
+        .solver-input {
+          width: 100%;
+          min-height: 82px;
+          line-height: 1.45;
+          resize: vertical;
+        }
+        .stack-input:focus, .select-input:focus, .solver-input:focus {
+          outline: none;
+          border-color: #4a8b6a;
+        }
+        .edit-btn {
+          position: absolute;
+          top: 18px;
+          right: 18px;
+          background: transparent;
+          border: 1px solid #2a2c29;
+          color: #8a8478;
+          padding: 4px 10px;
+          font-size: 10px;
+          letter-spacing: 1px;
+          border-radius: 4px;
+          cursor: pointer;
+          font-family: 'JetBrains Mono', monospace;
+        }
+        .edit-btn:hover { color: #c9a961; border-color: #c9a961; }
+        .combo-grid {
+          display: grid;
+          grid-template-columns: repeat(auto-fit, minmax(90px, 1fr));
+          gap: 8px;
+          max-width: 640px;
+        }
+        .summary-pill {
+          display: inline-flex;
+          align-items: center;
+          gap: 8px;
+          background: rgba(74,139,106,0.08);
+          border: 1px solid #2c5e44;
+          border-radius: 6px;
+          padding: 9px 12px;
+          font-family: 'JetBrains Mono', monospace;
+          font-size: 12px;
+          color: #cfc9b8;
+          line-height: 1.4;
+        }
+      
+        .action-groups { display: flex; flex-direction: column; gap: 14px; }
+        .action-group { display: flex; flex-direction: column; gap: 6px; }
+        .action-group-header {
+          font-size: 10px;
+          letter-spacing: 0.14em;
+          text-transform: uppercase;
+          color: #8a8478;
+          font-family: 'JetBrains Mono', monospace;
+          padding-bottom: 2px;
+          border-bottom: 1px solid #2a2c29;
+        }
+        .action-group-pills { display: flex; gap: 8px; flex-wrap: wrap; padding-top: 4px; }
+        .app-shell, .setup-shell { max-width: 1180px; margin: 0 auto; }
+        .setup-shell {
+          min-height: calc(100vh - 92px);
+          display: flex;
+          flex-direction: column;
+          justify-content: center;
+          gap: 24px;
+        }
+        .setup-title {
+          font-family: 'Fraunces', serif;
+          font-size: 44px;
+          font-weight: 500;
+          margin: 0;
+        }
+        .setup-copy { color: #8a8478; max-width: 620px; line-height: 1.6; margin: 0; }
+        .position-grid { display: grid; grid-template-columns: repeat(8, minmax(70px, 1fr)); gap: 8px; }
+        .topbar {
+          display: flex;
+          justify-content: space-between;
+          align-items: flex-end;
+          gap: 18px;
+          margin-bottom: 18px;
+        }
+        .topbar h1 {
+          font-family: 'Fraunces', serif;
+          font-size: 32px;
+          font-weight: 500;
+          margin: 0 0 4px;
+        }
+        .topbar p { margin: 0; color: #8a8478; font-size: 13px; }
+        .dashboard-grid {
+          display: grid;
+          grid-template-columns: minmax(360px, 1.25fr) minmax(260px, 0.85fr) minmax(300px, 1fr);
+          gap: 12px;
+          align-items: start;
+        }
+        .bottom-grid {
+          display: grid;
+          grid-template-columns: minmax(0, 1.15fr) minmax(300px, 0.85fr);
+          gap: 12px;
+          margin-top: 12px;
+        }
+        .panel, .range-card {
+          background: #151715;
+          border: 1px solid #292c27;
+          border-radius: 8px;
+          padding: 16px;
+        }
+        .panel-heading {
+          display: flex;
+          justify-content: space-between;
+          gap: 12px;
+          align-items: flex-start;
+          margin-bottom: 12px;
+        }
+        .panel-heading h3 {
+          margin: 0 0 4px;
+          font-size: 15px;
+          font-weight: 700;
+          color: #ebe7da;
+        }
+        .panel-heading p { margin: 0; color: #8a8478; font-size: 12px; line-height: 1.4; }
+        .mini-stat {
+          flex: 0 0 auto;
+          border: 1px solid #2c5e44;
+          border-radius: 5px;
+          padding: 5px 7px;
+          font-family: 'JetBrains Mono', monospace;
+          font-size: 10px;
+          color: #cfc9b8;
+        }
+        .player-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+        .player-card {
+          min-height: 220px;
+          border: 1px solid #292c27;
+          border-radius: 8px;
+          padding: 12px;
+          background: #10120f;
+        }
+        .player-card.hero { border-color: #365f48; }
+        .player-card.active { box-shadow: 0 0 0 1px rgba(201, 169, 97, 0.5); border-color: #c9a961; }
+        .seat-top { display: flex; justify-content: space-between; align-items: center; gap: 8px; margin-bottom: 10px; }
+        .role-tag {
+          font-family: 'JetBrains Mono', monospace;
+          font-size: 10px;
+          color: #c9a961;
+          letter-spacing: 0.12em;
+          text-transform: uppercase;
+        }
+        .seat-pos { font-size: 20px; font-weight: 700; }
+        .field-row { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin: 10px 0; }
+        .inline-input {
+          min-width: 0;
+          background: #1c1e1c;
+          border: 1px solid #2a2c29;
+          color: #ebe7da;
+          padding: 8px 10px;
+          border-radius: 6px;
+          font-family: 'JetBrains Mono', monospace;
+          font-size: 12px;
+        }
+        .inline-input:focus { outline: none; border-color: #4a8b6a; }
+        .action-row { display: flex; flex-wrap: wrap; gap: 7px; margin-top: 12px; }
+        .action-btn {
+          background: #1d201c;
+          border: 1px solid #30342f;
+          color: #d7d0be;
+          border-radius: 6px;
+          min-height: 34px;
+          padding: 7px 10px;
+          font-size: 12px;
+          font-weight: 700;
+          cursor: pointer;
+        }
+        .action-btn:hover:not(:disabled) { border-color: #c9a961; color: #fff8e6; }
+        .action-btn:disabled { opacity: 0.32; cursor: not-allowed; }
+        .board-cards { display: flex; gap: 8px; flex-wrap: wrap; margin-bottom: 12px; }
+        .board-slot {
+          border: 1px dashed #343830;
+          border-radius: 8px;
+          padding: 4px;
+          min-width: 74px;
+          min-height: 102px;
+          display: flex;
+          align-items: center;
+          justify-content: center;
+          color: #5a564c;
+          font-family: 'JetBrains Mono', monospace;
+          font-size: 10px;
+          cursor: pointer;
+        }
+        .board-slot.active { border-color: #c9a961; }
+        .range-section { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; margin-top: 12px; }
+        .range-legend {
+          display: flex;
+          gap: 10px;
+          flex-wrap: wrap;
+          margin: 0 0 10px;
+          color: #9a9485;
+          font-size: 11px;
+          font-family: 'JetBrains Mono', monospace;
+        }
+        .range-legend span {
+          display: inline-flex;
+          align-items: center;
+          gap: 5px;
+        }
+        .legend-dot {
+          width: 8px;
+          height: 8px;
+          border-radius: 50%;
+          display: inline-block;
+        }
+        .range-grid { display: grid; grid-template-columns: repeat(13, 1fr); gap: 2px; }
+        .range-cell {
+          aspect-ratio: 1;
+          border: 1px solid #252822;
+          border-radius: 3px;
+          display: flex;
+          align-items: center;
+          justify-content: center;
+          background: #10120f;
+          color: #4f514b;
+          font-family: 'JetBrains Mono', monospace;
+          font-size: 10px;
+          font-weight: 700;
+        }
+        .range-cell.active {
+          background: var(--range-accent);
+          border-color: var(--range-accent);
+          color: #0d0e0c;
+        }
+        .range-cell.action-raise, .legend-dot.action-raise {
+          background: #c98224;
+          border-color: #d7953d;
+          color: #0d0e0c;
+        }
+        .range-cell.action-call, .legend-dot.action-call {
+          background: #3f8e67;
+          border-color: #57a77e;
+          color: #07100b;
+        }
+        .range-cell.action-fold, .legend-dot.action-fold {
+          background: #17364a;
+          border-color: #24506a;
+          color: #a4b7c4;
+        }
+        .range-cell.pair.active { box-shadow: inset 0 0 0 1px rgba(255,255,255,0.28); }
+        .line-strip {
+          border-top: 1px solid #292c27;
+          margin-top: 12px;
+          padding-top: 12px;
+          color: #8a8478;
+          font-size: 12px;
+          line-height: 1.5;
+        }
+        .current-action-box {
+          margin-top: 12px;
+          border-top: 1px solid #292c27;
+          padding-top: 12px;
+          max-width: 360px;
+        }
+        .current-action-title {
+          color: #ebe7da;
+          font-weight: 700;
+          margin-bottom: 8px;
+        }
+        .action-log { display: flex; flex-direction: column; gap: 8px; max-height: 360px; overflow: auto; }
+        .log-row {
+          display: grid;
+          grid-template-columns: 72px 1fr auto;
+          gap: 8px;
+          align-items: center;
+          border-bottom: 1px solid #242722;
+          padding-bottom: 7px;
+          font-size: 12px;
+        }
+        .log-row span:first-child, .log-row span:last-child {
+          font-family: 'JetBrains Mono', monospace;
+          color: #8a8478;
+          font-size: 10px;
+        }
+        .recommendation-panel .rec-action { margin-bottom: 13px; }
+        @media (max-width: 980px) {
+          .dashboard-grid, .bottom-grid, .range-section { grid-template-columns: 1fr; }
+          .position-grid { grid-template-columns: repeat(4, 1fr); }
+        }
+        @media (max-width: 620px) {
+          .player-grid { grid-template-columns: 1fr; }
+          .topbar { align-items: flex-start; flex-direction: column; }
+          .range-cell { font-size: 8px; }
+        }
+`}</style>
+
+      {!heroPos ? (
+        <main className="setup-shell">
+          <div>
+            <div style={{
+              fontFamily: 'JetBrains Mono, monospace',
+              fontSize: 10,
+              letterSpacing: 4,
+              color: '#c9a961',
+              marginBottom: 10,
+            }}>
+              PREFLOP START
+            </div>
+            <h1 className="setup-title">Choose Hero Position</h1>
+            <p className="setup-copy">
+              Pick the Hero seat first. The analyser then stays on one simplified 1v1 table where player buttons feed the preflop and postflop action directly.
+            </p>
+          </div>
+          <div className="position-grid">
+            {positions.map((p, idx) => (
+              <button key={p} className="pill-btn" onClick={() => selectHeroPosition(p)}>
+                <span style={{ opacity: 0.45, marginRight: 5, fontFamily: 'JetBrains Mono, monospace', fontSize: '0.85em' }}>{idx + 1}</span>{p}
+              </button>
+            ))}
+          </div>
+        </main>
+      ) : (
+        <main className="app-shell">
+          <header className="topbar">
+            <div>
+              <h1>Post-Flop Analyser</h1>
+              <p>{flowStatus}</p>
+            </div>
+            <button className="pill-btn" onClick={() => resetFrom(1)}>Change Hero Position</button>
+          </header>
+
+          <section className="dashboard-grid">
+            <section className="panel">
+              <div className="panel-heading">
+                <div>
+                  <h3>Players</h3>
+                  <p>1v1 action entry. Hero stays on the left.</p>
+                </div>
+                <span className="mini-stat">{heroIP === null ? '1v1' : heroIP ? 'Hero IP' : 'Hero OOP'}</span>
+              </div>
+
+              <div className="player-grid">
+                <div className={`player-card hero ${expectedPreflopActor() === 'Hero' || expectedPostflopActor() === 'Hero' ? 'active' : ''}`}>
+                  <div className="seat-top">
+                    <div>
+                      <div className="role-tag">Hero</div>
+                      <div className="seat-pos">{heroPos}</div>
+                    </div>
+                    <button className="edit-btn" style={{ position: 'static' }} onClick={() => resetFrom(2)}>HAND</button>
+                  </div>
+
+                  <div className="field-row">
+                    <span style={{ color: '#8a8478', fontSize: 12 }}>Stack</span>
+                    <input
+                      type="number"
+                      className="inline-input"
+                      style={{ width: 86 }}
+                      value={heroStack}
+                      onChange={e => setHeroStack(Math.max(1, Number(e.target.value) || 0))}
+                      min="1"
+                    />
+                    <span style={{ fontFamily: 'JetBrains Mono, monospace', color: '#8a8478', fontSize: 11 }}>BB</span>
+                  </div>
+
+                  {!combo ? (
+                    <>
+                      <div className="field-row">
+                        <input
+                          type="text"
+                          className="inline-input"
+                          style={{ width: 140, textTransform: 'none' }}
+                          placeholder="AhKs"
+                          value={holeInput}
+                          onChange={e => setHoleInput(e.target.value)}
+                          onKeyDown={e => { if (e.key === 'Enter') submitHoleInput(); }}
+                        />
+                        <button className="action-btn" onClick={submitHoleInput}>Set</button>
+                        <button className="action-btn" onClick={() => setShowHolePicker(value => !value)}>
+                          {showHolePicker ? 'Hide' : 'Choose'}
+                        </button>
+                      </div>
+                      <div style={{ color: '#5a564c', fontSize: 11 }}>Exact combo is needed for postflop analysis.</div>
+                      {showHolePicker && (
+                        <div style={{ marginTop: 10 }}>
+                          <div className="board-cards" style={{ marginBottom: 10 }}>
+                            {[0, 1].map(idx => (
+                              <div
+                                key={idx}
+                                className={`board-slot ${pickingHoleIdx === idx ? 'active' : ''}`}
+                                style={{ minWidth: 46, minHeight: 64 }}
+                                onClick={() => setPickingHoleIdx(idx)}
+                              >
+                                {holePickerCards[idx] ? (
+                                  <Card rank={holePickerCards[idx].rank} suit={holePickerCards[idx].suit} size="sm" />
+                                ) : (
+                                  idx === 0 ? 'Card 1' : 'Card 2'
+                                )}
+                              </div>
+                            ))}
+                          </div>
+                          <CardPicker
+                            disabled={holePickerCards.filter(Boolean)}
+                            selectedCards={holePickerCards}
+                            onPick={pickHoleCard}
+                          />
+                        </div>
+                      )}
+                    </>
+                  ) : (
+                    <div className="field-row">
+                      <Card rank={combo[0].rank} suit={combo[0].suit} size="sm" />
+                      <Card rank={combo[1].rank} suit={combo[1].suit} size="sm" />
+                    </div>
+                  )}
+
+                  {heroHand && !combo && (
+                    <div className="combo-grid" style={{ gridTemplateColumns: 'repeat(auto-fit, minmax(74px, 1fr))', marginTop: 10 }}>
+                      {generateCombos(heroHand.r1, heroHand.r2, heroHand.type).map((cb, idx) => (
+                        <button
+                          key={idx}
+                          className="action-btn"
+                          onClick={() => {
+                            setCombo(cb);
+                            setHolePickerCards(cb);
+                            setShowHolePicker(false);
+                          }}
+                          style={{ display: 'flex', justifyContent: 'center', gap: 3, padding: 5 }}
+                        >
+                          <Card rank={cb[0].rank} suit={cb[0].suit} size="sm" />
+                          <Card rank={cb[1].rank} suit={cb[1].suit} size="sm" />
+                        </button>
+                      ))}
+                    </div>
+                  )}
+
+                  {combo && (
+                    <div className="line-strip">
+                      {currentActionActor === 'Hero' ? 'Acting now' : 'Waiting'}
+                    </div>
+                  )}
+                </div>
+
+                <div className={`player-card ${expectedPreflopActor() === 'Villain' || expectedPostflopActor() === 'Villain' ? 'active' : ''}`}>
+                  <div className="seat-top">
+                    <div>
+                      <div className="role-tag">Villain</div>
+                      <div className="seat-pos">{villainPos || 'Seat'}</div>
+                    </div>
+                    {villainPos && <button className="edit-btn" style={{ position: 'static' }} onClick={() => resetFrom(3)}>SEAT</button>}
+                  </div>
+
+                  {!villainPos ? (
+                    <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap' }}>
+                      {positions.map(p => p === heroPos ? null : (
+                        <button key={p} className="action-btn" onClick={() => selectVillainPosition(p)}>{p}</button>
+                      ))}
+                    </div>
+                  ) : (
+                    <>
+                      <div className="field-row">
+                        <span style={{ color: '#8a8478', fontSize: 12 }}>Stack</span>
+                        <input
+                          type="number"
+                          className="inline-input"
+                          style={{ width: 86 }}
+                          value={villainStack}
+                          onChange={e => setVillainStack(Math.max(1, Number(e.target.value) || 0))}
+                          min="1"
+                        />
+                        <span style={{ fontFamily: 'JetBrains Mono, monospace', color: '#8a8478', fontSize: 11 }}>BB</span>
+                      </div>
+                      <div className="line-strip">
+                        {currentActionActor === 'Villain' ? 'Acting now' : 'Waiting'}
+                      </div>
+                    </>
+                  )}
+                </div>
+              </div>
+
+              <div className="current-action-box">
+                <div className="current-action-title">
+                  {currentActionActor ? `${rolePosition(currentActionActor)} action` : 'Actions'}
+                </div>
+                <div className="action-row" style={{ marginTop: 0 }}>
+                  {currentActionItems.length === 0 ? (
+                    <span style={{ color: '#5a564c', fontSize: 12 }}>
+                      {selectedPreflopAction ? `Input the ${streetLabel.toLowerCase()} to unlock actions.` : 'Choose seats and cards to begin.'}
+                    </span>
+                  ) : currentActionItems.map(action => (
+                    <button key={action.key} className="action-btn" disabled={action.disabled} onClick={action.onClick}>
+                      {rolePosition(currentActionActor)} {action.label}
+                    </button>
+                  ))}
+                </div>
+              </div>
+
+              {selectedPreflopAction && (
+                <div className="line-strip">
+                  {selectedPreflopAction.label} - {selectedPreflopAction.potType}, pot {formatBB(potBB)} BB, remaining eff {formatBB(remainingStackBB)} BB
+                </div>
+              )}
+
+              {combo && villainPos && !selectedPreflopAction && (
+                <div className="line-strip">Preflop starts with {roleLabel(firstPreflopActor())}. Call becomes available after a raise.</div>
+              )}
+            </section>
+
+            <section className="panel">
+              <div className="panel-heading">
+                <div>
+                  <h3>Board</h3>
+                  <p>{selectedPreflopAction ? `Input ${streetLabel.toLowerCase()} cards after the round ends.` : 'Complete preflop first.'}</p>
+                </div>
+                <span className="mini-stat">{streetLabel}</span>
+              </div>
+
+              <div className="board-cards">
+                {Array.from({ length: boardCardCount }, (_, idx) => (
+                  <div
+                    key={idx}
+                    className={`board-slot ${pickingBoardIdx === idx ? 'active' : ''}`}
+                    onClick={() => {
+                      setPickingBoardIdx(idx);
+                      if (selectedPreflopAction && !handEnded) setShowBoardPicker(true);
+                    }}
+                  >
+                    {board[idx] ? <Card rank={board[idx].rank} suit={board[idx].suit} size="lg" /> : BOARD_LABELS[idx]}
+                  </div>
+                ))}
+              </div>
+
+              {selectedPreflopAction && !handEnded && (
+                <>
+                  <div className="field-row">
+                    <input
+                      type="text"
+                      className="inline-input"
+                      style={{ width: 150, textTransform: 'none' }}
+                      placeholder={street === 'flop' ? 'AhKd7c' : street === 'turn' ? '2s' : 'Jh'}
+                      value={boardInput}
+                      onChange={e => setBoardInput(e.target.value)}
+                      onKeyDown={e => { if (e.key === 'Enter') submitBoardInput(); }}
+                    />
+                    <button className="action-btn" onClick={submitBoardInput}>Set</button>
+                    <button className="action-btn" onClick={() => setShowBoardPicker(value => !value)}>
+                      {showBoardPicker ? 'Hide' : 'Choose'}
+                    </button>
+                    {boardComplete && <button className="action-btn" onClick={resetVisibleBoard}>Edit</button>}
+                  </div>
+                  {showBoardPicker && (
+                    <CardPicker
+                      disabled={disabledCards}
+                      selectedCards={boardCards}
+                      onPick={card => {
+                        const newBoard = [...board];
+                        newBoard[pickingBoardIdx] = card;
+                        setBoard(newBoard);
+                        setCurrentDecisionId('');
+                        setStreetActionSequence([]);
+                        setEquityResult(null);
+                        const next = newBoard.slice(0, boardCardCount).findIndex(c => c === null);
+                        if (next !== -1) setPickingBoardIdx(next);
+                        else setShowBoardPicker(false);
+                      }}
+                    />
+                  )}
+                </>
+              )}
+            </section>
+
+            <section className="panel">
+              <div className="panel-heading">
+                <div>
+                  <h3>Profile</h3>
+                  <p>Street, action path, and optional node override.</p>
+                </div>
+                <span className="mini-stat">{currentDecision ? 'Hero turn' : 'Waiting'}</span>
+              </div>
+
+              <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap', marginBottom: 12 }}>
+                {heroIP !== null && <span className="summary-pill">{heroIP ? 'Hero IP' : 'Hero OOP'}</span>}
+                {currentDecision && <span className="summary-pill">{currentDecision.label}</span>}
+                {decisionPotInfo && <span className="summary-pill">Action pot {formatBB(decisionPotInfo.potAtDecision)} BB</span>}
+              </div>
+
+              <textarea
+                className="solver-input"
+                style={{ minHeight: 112 }}
+                value={solverNodeJson}
+                onChange={e => setSolverNodeJson(e.target.value)}
+                placeholder='Optional solver JSON'
+              />
+              {solverJsonResult.error && (
+                <div style={{ color: '#9a3737', fontSize: 12, marginTop: 8, fontFamily: 'JetBrains Mono, monospace' }}>
+                  {solverJsonResult.error}
+                </div>
+              )}
+            </section>
+          </section>
+
+          <section className="range-section">
+            <RangeMatrix
+              title="Hero Preflop Range"
+              subtitle={heroRangeView.label}
+              rangeSet={heroRangeView.rangeSet}
+              comboCount={heroRangeView.comboCount}
+              actionMap={heroRangeView.actionMap}
+              accent="#4a8b6a"
+            />
+            <RangeMatrix
+              title="Villain Perceived Range"
+              subtitle={villainRangeView.label}
+              rangeSet={villainRangeView.rangeSet}
+              comboCount={villainRangeView.comboCount}
+              actionMap={villainRangeView.actionMap}
+              accent="#c9a961"
+            />
+          </section>
+
+          <section className="bottom-grid">
+            <section className="panel recommendation-panel">
+              <div className="panel-heading">
+                <div>
+                  <h3>Recommendation</h3>
+                  <p>{recommendation ? recommendation.sourceLabel : 'Recommendations appear when Hero is facing a decision.'}</p>
+                </div>
+                {recommendation && <span className="mini-stat">#{recommendationNumber}</span>}
+              </div>
+
+              {recommendation && handEval ? (
+                <>
+                  <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap', marginBottom: 14 }}>
+                    <span className="summary-pill">{handEval.madeLabel}</span>
+                    {handEval.drawLabels.length > 0 && <span className="summary-pill">+ {handEval.drawLabels.join(', ')}</span>}
+                    {equityResult?.status === 'ready' && equityResult.equity != null && (
+                      <span className="summary-pill">Equity {(equityResult.equity * 100).toFixed(1)}%</span>
+                    )}
+                  </div>
+                  {recommendation.actions.map(act => (
+                    <div className="rec-action" key={act.name}>
+                      <div style={{ display: 'flex', justifyContent: 'space-between', gap: 12, marginBottom: 5 }}>
+                        <strong style={{ color: act.color }}>{act.name}</strong>
+                        <span style={{ color: act.color, fontFamily: 'JetBrains Mono, monospace' }}>{act.pct}%</span>
+                      </div>
+                      <div style={{ height: 8, background: '#0d0e0c', borderRadius: 4, overflow: 'hidden' }}>
+                        <div style={{ width: `${act.pct}%`, height: '100%', background: act.color }} />
+                      </div>
+                      <div style={{ color: '#8a8478', fontSize: 11, marginTop: 4 }}>{act.detail}</div>
+                    </div>
+                  ))}
+                </>
+              ) : (
+                <div style={{ color: '#5a564c', fontSize: 12, lineHeight: 1.6 }}>
+                  Use the player buttons to reach Hero's decision point. No separate action list is needed.
+                </div>
+              )}
+            </section>
+
+            <section className="panel">
+              <div className="panel-heading">
+                <div>
+                  <h3>Action Log</h3>
+                  <p>Clicks from the player section are recorded here.</p>
+                </div>
+                <span className="mini-stat">{actionLog.length}</span>
+              </div>
+              <div className="action-log">
+                {actionLog.length === 0 ? (
+                  <div style={{ color: '#5a564c', fontSize: 12 }}>No action yet.</div>
+                ) : actionLog.map(item => (
+                  <div className="log-row" key={item.id}>
+                    <span>{item.street}</span>
+                    <strong>{item.actor}</strong>
+                    <span>{item.action}</span>
+                  </div>
+                ))}
+              </div>
+              {handEnded && (
+                <button className="pill-btn" style={{ marginTop: 14 }} onClick={() => resetFrom(4)}>Reset Action</button>
+              )}
+            </section>
+          </section>
+
+          <div style={{
+            marginTop: 26,
+            textAlign: 'center',
+            fontSize: 10,
+            color: '#3a3a36',
+            fontFamily: 'JetBrains Mono, monospace',
+            letterSpacing: 2,
+          }}>
+            POST-FLOP ANALYSER - v2
+          </div>
+        </main>
+      )}
+    </div>
+  );
+}
+
+
+ReactDOM.createRoot(document.getElementById('root')).render(<App />);
+  </script>
+</body>
+</html>
