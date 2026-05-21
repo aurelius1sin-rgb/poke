@@ -4127,10 +4127,11 @@ function App() {
         .topbar p { margin: 0; color: #8a8478; font-size: 13px; }
         .dashboard-grid {
           display: grid;
-          grid-template-columns: minmax(360px, 1.25fr) minmax(260px, 0.85fr) minmax(300px, 1fr);
+          grid-template-columns: minmax(0, 1.1fr) minmax(0, 0.9fr) minmax(0, 1fr);
           gap: 12px;
-          align-items: start;
+          align-items: stretch;
         }
+        .dashboard-grid.bottom-row { margin-top: 12px; }
         .bottom-grid {
           display: grid;
           grid-template-columns: minmax(0, 1.15fr) minmax(300px, 0.85fr);
@@ -4141,7 +4142,8 @@ function App() {
           background: #151715;
           border: 1px solid #292c27;
           border-radius: 8px;
-          padding: 16px;
+          padding: 14px;
+          min-width: 0;
         }
         .panel-heading {
           display: flex;
@@ -4329,41 +4331,7 @@ function App() {
         }
 `}</style>
 
-      {!heroPos ? (
-        <main className="setup-shell">
-          <div>
-            <div style={{
-              fontFamily: 'JetBrains Mono, monospace',
-              fontSize: 10,
-              letterSpacing: 4,
-              color: '#c9a961',
-              marginBottom: 10,
-            }}>
-              PREFLOP START
-            </div>
-            <h1 className="setup-title">Choose Hero Position</h1>
-            <p className="setup-copy">
-              Pick the Hero seat first. The analyser then stays on one simplified 1v1 table where player buttons feed the preflop and postflop action directly.
-            </p>
-          </div>
-          <div className="position-grid">
-            {positions.map((p, idx) => (
-              <button key={p} className="pill-btn" onClick={() => selectHeroPosition(p)}>
-                <span style={{ opacity: 0.45, marginRight: 5, fontFamily: 'JetBrains Mono, monospace', fontSize: '0.85em' }}>{idx + 1}</span>{p}
-              </button>
-            ))}
-          </div>
-        </main>
-      ) : (
-        <main className="app-shell">
-          <header className="topbar">
-            <div>
-              <h1>Post-Flop Analyser</h1>
-              <p>{flowStatus}</p>
-            </div>
-            <button className="pill-btn" onClick={() => resetFrom(1)}>Change Hero Position</button>
-          </header>
-
+      <main className="app-shell">
           <section className="dashboard-grid">
             <section className="panel">
               <div className="panel-heading">
@@ -4379,10 +4347,20 @@ function App() {
                   <div className="seat-top">
                     <div>
                       <div className="role-tag">Hero</div>
-                      <div className="seat-pos">{heroPos}</div>
+                      <div className="seat-pos">{heroPos || 'Seat'}</div>
                     </div>
-                    <button className="edit-btn" style={{ position: 'static' }} onClick={() => resetFrom(2)}>HAND</button>
+                    {heroPos && <button className="edit-btn" style={{ position: 'static' }} onClick={() => resetFrom(2)}>HAND</button>}
                   </div>
+
+                  {!heroPos ? (
+                    <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap' }}>
+                      {positions.map((p, idx) => (
+                        <button key={p} className="action-btn" onClick={() => selectHeroPosition(p)}>
+                          <span style={{ opacity: 0.45, marginRight: 4, fontFamily: 'JetBrains Mono, monospace', fontSize: '0.85em' }}>{idx + 1}</span>{p}
+                        </button>
+                      ))}
+                    </div>
+                  ) : (<>
 
                   <div className="field-row">
                     <span style={{ color: '#8a8478', fontSize: 12 }}>Stack</span>
@@ -4473,6 +4451,7 @@ function App() {
                       {currentActionActor === 'Hero' ? 'Acting now' : 'Waiting'}
                     </div>
                   )}
+                  </>)}
                 </div>
 
                 <div className={`player-card ${expectedPreflopActor() === 'Villain' || expectedPostflopActor() === 'Villain' ? 'active' : ''}`}>
@@ -4606,34 +4585,29 @@ function App() {
             <section className="panel">
               <div className="panel-heading">
                 <div>
-                  <h3>Profile</h3>
-                  <p>Street, action path, and optional node override.</p>
+                  <h3>Action Log</h3>
+                  <p>Clicks from the player section are recorded here.</p>
                 </div>
-                <span className="mini-stat">{currentDecision ? 'Hero turn' : 'Waiting'}</span>
+                <span className="mini-stat">{actionLog.length}</span>
               </div>
-
-              <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap', marginBottom: 12 }}>
-                {heroIP !== null && <span className="summary-pill">{heroIP ? 'Hero IP' : 'Hero OOP'}</span>}
-                {currentDecision && <span className="summary-pill">{currentDecision.label}</span>}
-                {decisionPotInfo && <span className="summary-pill">Action pot {formatBB(decisionPotInfo.potAtDecision)} BB</span>}
+              <div className="action-log">
+                {actionLog.length === 0 ? (
+                  <div style={{ color: '#5a564c', fontSize: 12 }}>No action yet.</div>
+                ) : actionLog.map(item => (
+                  <div className="log-row" key={item.id}>
+                    <span>{item.street}</span>
+                    <strong>{item.actor}</strong>
+                    <span>{item.action}</span>
+                  </div>
+                ))}
               </div>
-
-              <textarea
-                className="solver-input"
-                style={{ minHeight: 112 }}
-                value={solverNodeJson}
-                onChange={e => setSolverNodeJson(e.target.value)}
-                placeholder='Optional solver JSON'
-              />
-              {solverJsonResult.error && (
-                <div style={{ color: '#9a3737', fontSize: 12, marginTop: 8, fontFamily: 'JetBrains Mono, monospace' }}>
-                  {solverJsonResult.error}
-                </div>
+              {handEnded && (
+                <button className="pill-btn" style={{ marginTop: 14 }} onClick={() => resetFrom(4)}>Reset Action</button>
               )}
             </section>
           </section>
 
-          <section className="range-section">
+          <section className="dashboard-grid bottom-row">
             <RangeMatrix
               title="Hero Preflop Range"
               subtitle={heroRangeView.label}
@@ -4650,9 +4624,7 @@ function App() {
               actionMap={villainRangeView.actionMap}
               accent="#c9a961"
             />
-          </section>
 
-          <section className="bottom-grid">
             <section className="panel recommendation-panel">
               <div className="panel-heading">
                 <div>
@@ -4690,44 +4662,10 @@ function App() {
                 </div>
               )}
             </section>
-
-            <section className="panel">
-              <div className="panel-heading">
-                <div>
-                  <h3>Action Log</h3>
-                  <p>Clicks from the player section are recorded here.</p>
-                </div>
-                <span className="mini-stat">{actionLog.length}</span>
-              </div>
-              <div className="action-log">
-                {actionLog.length === 0 ? (
-                  <div style={{ color: '#5a564c', fontSize: 12 }}>No action yet.</div>
-                ) : actionLog.map(item => (
-                  <div className="log-row" key={item.id}>
-                    <span>{item.street}</span>
-                    <strong>{item.actor}</strong>
-                    <span>{item.action}</span>
-                  </div>
-                ))}
-              </div>
-              {handEnded && (
-                <button className="pill-btn" style={{ marginTop: 14 }} onClick={() => resetFrom(4)}>Reset Action</button>
-              )}
-            </section>
           </section>
 
-          <div style={{
-            marginTop: 26,
-            textAlign: 'center',
-            fontSize: 10,
-            color: '#3a3a36',
-            fontFamily: 'JetBrains Mono, monospace',
-            letterSpacing: 2,
-          }}>
-            POST-FLOP ANALYSER - v2
-          </div>
+
         </main>
-      )}
     </div>
   );
 }
